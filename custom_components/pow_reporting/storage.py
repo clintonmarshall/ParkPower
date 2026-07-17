@@ -49,11 +49,16 @@ class PowReportingStore:
 def _empty_data() -> dict[str, Any]:
     """Return the current empty schema."""
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "sessions": [],
         "active_sessions": {},
         "thresholds": dict(DEFAULT_SESSION_THRESHOLDS),
         "outlet_state": {},
+        "load_management": {
+            "paused_outlets": {},
+            "relay_events": {},
+            "last_evaluation": {},
+        },
         "customers": [],
         "vehicles": [],
         "user_groups": [],
@@ -69,7 +74,7 @@ def _empty_data() -> dict[str, Any]:
 def _migrate_data(data: dict[str, Any]) -> dict[str, Any]:
     """Migrate storage in-place without invalidating existing records."""
     migrated = {**_empty_data(), **data}
-    migrated["schema_version"] = 3
+    migrated["schema_version"] = 4
     migrated["sessions"] = list(migrated.get("sessions") or [])
     migrated["customers"] = list(migrated.get("customers") or [])
     migrated["vehicles"] = list(migrated.get("vehicles") or [])
@@ -82,4 +87,10 @@ def _migrate_data(data: dict[str, Any]) -> dict[str, Any]:
         **dict(migrated.get("thresholds") or {}),
     }
     migrated["outlet_state"] = dict(migrated.get("outlet_state") or {})
+    load_management = dict(migrated.get("load_management") or {})
+    migrated["load_management"] = {
+        "paused_outlets": dict(load_management.get("paused_outlets") or {}),
+        "relay_events": dict(load_management.get("relay_events") or {}),
+        "last_evaluation": dict(load_management.get("last_evaluation") or {}),
+    }
     return migrated

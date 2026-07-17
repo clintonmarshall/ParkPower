@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import voluptuous as vol
 from aiohttp import web
@@ -51,7 +52,9 @@ from .const import (
 )
 from .coordinator import PowReportingCoordinator
 from .reporting import build_management_report, default_filter_period
+from .tenant_billing import TenantBillingManager
 from .websocket import (
+    async_load_hierarchy_manager,
     async_load_records_manager,
     async_load_session_manager,
     async_register_websocket_commands as async_register_session_websocket_commands,
@@ -65,6 +68,7 @@ STORAGE_VERSION = 1
 MAX_LOG_ROWS = 2000
 MAX_SESSION_ROWS = 10000
 DEFAULT_ENERGY_RATE = 0.32
+DEFAULT_STALE_AFTER_MINUTES = DEFAULT_SESSION_THRESHOLDS[CONF_METER_STALE_MINUTES]
 
 CONFIG_SCHEMA = vol.Schema(
     {
@@ -285,6 +289,8 @@ def _async_register_websocket_commands(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, _websocket_get_billing_report)
     websocket_api.async_register_command(hass, _websocket_get_management_report)
     websocket_api.async_register_command(hass, _websocket_save_billing_settings)
+    websocket_api.async_register_command(hass, _websocket_create_tenant_statement)
+    websocket_api.async_register_command(hass, _websocket_send_tenant_statement)
     websocket_api.async_register_command(hass, _websocket_control_outlet)
     websocket_api.async_register_command(hass, _websocket_all_off)
     websocket_api.async_register_command(hass, _websocket_auto_name_entities)
@@ -377,18 +383,29 @@ async def _async_load_billing(hass: HomeAssistant) -> dict[str, Any]:
         settings = {}
     settings.setdefault("energy_rate", DEFAULT_ENERGY_RATE)
     settings.setdefault("currency", "AUD")
+    settings.setdefault("notify_service", "")
+    settings.setdefault("sender_name", "ParkPower")
     active = data.get("active")
     if not isinstance(active, dict):
         active = {}
     completed = data.get("completed")
     if not isinstance(completed, list):
         completed = []
-    return {"settings": settings, "active": active, "completed": completed}
+    statements = data.get("statements")
+    if not isinstance(statements, list):
+        statements = []
+    return {
+        "settings": settings,
+        "active": active,
+        "completed": completed,
+        "statements": statements,
+    }
 
 
 async def _async_save_billing(hass: HomeAssistant, data: dict[str, Any]) -> None:
     """Persist billing/session data."""
     data["completed"] = data.get("completed", [])[-MAX_SESSION_ROWS:]
+    data["statements"] = data.get("statements", [])[-2000:]
     store = Store(hass, STORAGE_VERSION, BILLING_STORAGE_KEY)
     await store.async_save(data)
 
@@ -460,6 +477,7 @@ async def _async_record_session_event(
     reference: str,
     outlet_name: str,
     event: dict[str, Any],
+    customer_id: str = "",
 ) -> None:
     """Start or complete a persisted billing session."""
     if not event.get("success"):
@@ -471,17 +489,42 @@ async def _async_record_session_event(
     energy_entity_id = energy_state.entity_id if energy_state is not None else ""
     energy_kwh = _normalise_energy_kwh(energy_state)
     now = event.get("time") or datetime.now().astimezone().isoformat(timespec="seconds")
+    records = await async_load_records_manager(hass)
+    customer = next((row for row in records.customers if row.id == customer_id), None)
+    if customer is None:
+        customer = records.customer_for_outlet(switch_entity_id)
+    group = next(
+        (row for row in records.user_groups if customer and row.id == customer.user_group),
+        None,
+    )
+    base_rate = float(
+        customer.billing_rate_per_kwh
+        if customer and customer.billing_rate_per_kwh
+        else settings.get("energy_rate", DEFAULT_ENERGY_RATE)
+    )
+    discount = min(100.0, max(0.0, group.discount_percentage if group else 0.0))
+    session_rate = 0.0 if group and group.free_charging else base_rate * (1 - discount / 100)
+    session_currency = customer.billing_currency if customer else settings.get("currency", "AUD")
+    resolved_reference = reference
+    if not resolved_reference and customer is not None:
+        resolved_reference = customer.billing_reference or customer.display_name
 
     if action == "turn_on":
+        outlet_health = await _outlet_health_for_switch(hass, switch_entity_id)
+        if outlet_health and not _can_start_session_from_health(outlet_health):
+            return
         data["active"][switch_entity_id] = {
+            "session_id": uuid4().hex,
             "switch_entity_id": switch_entity_id,
             "outlet_name": outlet_name,
-            "reference": reference,
+            "reference": resolved_reference,
+            "customer_id": customer.id if customer else "",
             "start_time": now,
             "start_energy_kwh": energy_kwh,
             "energy_entity_id": energy_entity_id,
-            "rate": float(settings.get("energy_rate", DEFAULT_ENERGY_RATE) or DEFAULT_ENERGY_RATE),
-            "currency": settings.get("currency", "AUD"),
+            "rate": session_rate,
+            "currency": session_currency,
+            "billing_status": "draft",
         }
     elif action == "turn_off":
         active = data["active"].pop(switch_entity_id, None)
@@ -494,7 +537,12 @@ async def _async_record_session_event(
                 if energy_kwh is not None and isinstance(start_energy, (int, float))
                 else None
             )
-            rate = float(active.get("rate", settings.get("energy_rate", DEFAULT_ENERGY_RATE)) or DEFAULT_ENERGY_RATE)
+            stored_rate = active.get("rate")
+            rate = float(
+                stored_rate
+                if stored_rate is not None
+                else settings.get("energy_rate", DEFAULT_ENERGY_RATE)
+            )
             data["completed"].append(
                 {
                     **active,
@@ -514,8 +562,12 @@ async def _async_record_session_event(
         manager.start_session(
             outlet_entity_id=switch_entity_id,
             outlet_display_name=outlet_name,
-            customer_reference=reference,
+            customer_reference=resolved_reference,
             start_meter_reading=energy_kwh,
+            metadata={
+                "customer_id": customer.id if customer else "",
+                "user_group": customer.user_group if customer else "",
+            },
         )
     elif action == "turn_off":
         manager.complete_session(
@@ -535,13 +587,17 @@ def _billing_report(hass: HomeAssistant, data: dict[str, Any]) -> dict[str, Any]
     for session in data["active"].values():
         start_time = datetime.fromisoformat(session["start_time"])
         current_energy = _normalise_energy_kwh(hass.states.get(session.get("energy_entity_id", "")))
+        state = hass.states.get(session.get("energy_entity_id", ""))
+        if state is not None and _state_is_stale(state, DEFAULT_STALE_AFTER_MINUTES):
+            current_energy = None
         start_energy = session.get("start_energy_kwh")
         energy_used = (
             max(0, current_energy - start_energy)
             if current_energy is not None and isinstance(start_energy, (int, float))
             else None
         )
-        session_rate = float(session.get("rate", rate) or rate)
+        stored_rate = session.get("rate")
+        session_rate = float(stored_rate if stored_rate is not None else rate)
         active.append(
             {
                 **session,
@@ -554,7 +610,8 @@ def _billing_report(hass: HomeAssistant, data: dict[str, Any]) -> dict[str, Any]
         )
     completed = []
     for session in data["completed"]:
-        session_rate = float(session.get("rate", rate) or rate)
+        stored_rate = session.get("rate")
+        session_rate = float(stored_rate if stored_rate is not None else rate)
         energy_kwh = session.get("energy_kwh")
         completed.append(
             {
@@ -568,6 +625,7 @@ def _billing_report(hass: HomeAssistant, data: dict[str, Any]) -> dict[str, Any]
         "active": active,
         "completed": completed,
         "sessions": [*completed, *active],
+        "statements": data.get("statements", []),
     }
 
 
@@ -654,6 +712,213 @@ def _best_device_sensor(
     return candidates[0][1], candidates[0][2]
 
 
+def _mapped_or_best_sensor(
+    hass: HomeAssistant,
+    entity_registry: Any,
+    device_id: str | None,
+    mapped_entity_id: Any,
+    *,
+    kind: str,
+) -> tuple[str | None, Any]:
+    """Return an explicitly mapped sensor before falling back to device discovery."""
+    mapped = str(mapped_entity_id or "").strip()
+    if mapped:
+        return mapped, hass.states.get(mapped)
+    return _best_device_sensor(hass, entity_registry, device_id, kind=kind)
+
+
+def _state_timestamp(state: Any) -> datetime | None:
+    """Return the best timestamp available for a Home Assistant State."""
+    if state is None:
+        return None
+    return getattr(state, "last_updated", None) or getattr(state, "last_changed", None)
+
+
+def _iso_timestamp(value: datetime | None) -> str:
+    """Return a JSON timestamp for optional datetimes."""
+    return value.isoformat(timespec="seconds") if value else ""
+
+
+def _state_is_stale(state: Any, stale_after_minutes: int | float) -> bool:
+    """Return true when a state has not updated inside the stale window."""
+    timestamp = _state_timestamp(state)
+    if timestamp is None:
+        return True
+    return datetime.now().astimezone() - timestamp > timedelta(minutes=float(stale_after_minutes))
+
+
+def _state_is_online(state: Any) -> bool | None:
+    """Interpret common HA/MQTT online/offline states."""
+    if state is None:
+        return None
+    value = str(state.state).strip().lower()
+    if value in {"on", "online", "home", "connected", "true", "1"}:
+        return True
+    if value in {"off", "offline", "not_home", "disconnected", "false", "0", "unavailable", "unknown"}:
+        return False
+    return None
+
+
+def _read_number_from_state(hass: HomeAssistant, entity_id: Any) -> float | None:
+    """Read a numeric HA state without unit conversion."""
+    state = hass.states.get(str(entity_id or ""))
+    if state is None:
+        return None
+    try:
+        return float(state.state)
+    except (TypeError, ValueError):
+        return None
+
+
+def _source_type_for_entry(entity_entry: Any) -> str:
+    """Infer outlet source type from the HA registry entry."""
+    platform = str(getattr(entity_entry, "platform", "") or "").lower()
+    if platform == "mqtt":
+        return "mqtt"
+    if platform == "esphome":
+        return "esphome_native"
+    return "manual"
+
+
+def _outlet_connectivity(
+    *,
+    switch_state: Any,
+    power_state: Any,
+    energy_state: Any,
+    availability_state: Any,
+    rssi_state: Any,
+    mapping: dict[str, Any],
+    stale_after_minutes: int,
+) -> dict[str, Any]:
+    """Build a connectivity snapshot for one outlet."""
+    availability = _state_is_online(availability_state)
+    if availability is None:
+        switch_value = str(getattr(switch_state, "state", "") or "").lower()
+        availability = switch_value not in {"unavailable", "unknown", ""}
+    manual_availability = str(mapping.get("outlet_availability") or "").strip().lower()
+    if manual_availability in {"online", "offline", "available", "unavailable"}:
+        availability = manual_availability in {"online", "available"}
+
+    telemetry_states = [state for state in (power_state, energy_state) if state is not None]
+    timestamps = [timestamp for timestamp in (_state_timestamp(state) for state in telemetry_states) if timestamp is not None]
+    last_seen_dt = max(timestamps, default=None)
+    if not last_seen_dt:
+        last_seen_dt = _state_timestamp(switch_state)
+    mapped_last_seen = str(mapping.get("outlet_last_seen") or "").strip()
+    if mapped_last_seen:
+        try:
+            last_seen_dt = datetime.fromisoformat(mapped_last_seen)
+        except ValueError:
+            pass
+
+    is_stale = False
+    if telemetry_states:
+        is_stale = all(_state_is_stale(state, stale_after_minutes) for state in telemetry_states)
+    elif last_seen_dt is not None:
+        is_stale = datetime.now().astimezone() - last_seen_dt > timedelta(minutes=stale_after_minutes)
+
+    rssi = _normalise_power_w(rssi_state)
+    if rssi is None and mapping.get("outlet_rssi") not in (None, ""):
+        try:
+            rssi = float(mapping["outlet_rssi"])
+        except (TypeError, ValueError):
+            rssi = None
+
+    state = "online"
+    if availability is False:
+        state = "offline"
+    elif is_stale:
+        state = "stale"
+
+    return {
+        "state": state,
+        "outlet_last_seen": _iso_timestamp(last_seen_dt),
+        "outlet_rssi": rssi,
+        "outlet_availability": "online" if availability else "offline",
+        "is_stale": state == "stale",
+    }
+
+
+def _gateway_snapshot(hass: HomeAssistant, mapping: dict[str, Any]) -> dict[str, Any] | None:
+    """Return gateway metadata and status discovered from mapped HA/MQTT entities."""
+    gateway_id = str(mapping.get("gateway_id") or "").strip()
+    gateway_name = str(mapping.get("gateway_name") or gateway_id).strip()
+    if not gateway_id and not gateway_name:
+        return None
+
+    def entity(suffix: str) -> str:
+        base = (gateway_id or gateway_name).lower().replace(" ", "_").replace("-", "_")
+        return f"sensor.{base}_{suffix}"
+
+    online_entity_id = str(mapping.get("gateway_online_entity_id") or "").strip()
+    if not online_entity_id and (gateway_id or gateway_name):
+        base = (gateway_id or gateway_name).lower().replace(" ", "_").replace("-", "_")
+        online_entity_id = f"binary_sensor.{base}_online"
+    uptime_state = hass.states.get(str(mapping.get("gateway_uptime_entity_id") or entity("uptime")))
+    client_count = _read_number_from_state(hass, mapping.get("gateway_client_count_entity_id") or entity("client_count"))
+    uplink_rssi = _read_number_from_state(hass, mapping.get("gateway_uplink_rssi_entity_id") or entity("uplink_rssi"))
+    free_heap = _read_number_from_state(hass, mapping.get("gateway_free_heap_entity_id") or entity("free_heap"))
+    online_state = hass.states.get(online_entity_id)
+    online = _state_is_online(online_state)
+
+    if client_count is None and mapping.get("gateway_client_count") not in (None, ""):
+        try:
+            client_count = float(mapping["gateway_client_count"])
+        except (TypeError, ValueError):
+            client_count = None
+    if uplink_rssi is None and mapping.get("gateway_uplink_rssi") not in (None, ""):
+        try:
+            uplink_rssi = float(mapping["gateway_uplink_rssi"])
+        except (TypeError, ValueError):
+            uplink_rssi = None
+
+    last_seen = _state_timestamp(online_state) or _state_timestamp(uptime_state)
+    mapped_last_seen = str(mapping.get("gateway_last_seen") or "").strip()
+    if mapped_last_seen:
+        try:
+            last_seen = datetime.fromisoformat(mapped_last_seen)
+        except ValueError:
+            pass
+
+    status = str(mapping.get("gateway_status") or "").strip().lower()
+    if online is False:
+        status = "offline"
+    elif online is True and not status:
+        status = "online"
+    elif not status:
+        status = "unknown"
+
+    return {
+        "gateway_id": gateway_id,
+        "gateway_name": gateway_name,
+        "gateway_zone": mapping.get("gateway_zone", ""),
+        "gateway_ip": mapping.get("gateway_ip", ""),
+        "gateway_ssid": mapping.get("gateway_ssid", ""),
+        "gateway_subnet": mapping.get("gateway_subnet", ""),
+        "gateway_last_seen": _iso_timestamp(last_seen),
+        "gateway_uplink_rssi": uplink_rssi,
+        "gateway_client_count": client_count,
+        "gateway_status": status,
+        "gateway_uptime": uptime_state.state if uptime_state is not None else "",
+        "gateway_free_heap": free_heap,
+        "gateway_online_entity_id": online_entity_id,
+    }
+
+
+def _can_start_session_from_health(outlet: dict[str, Any]) -> bool:
+    """Return true when outlet telemetry is fresh enough to start billing."""
+    if outlet.get("connectivity_state") in {"offline", "stale", "gateway_unreachable"}:
+        return False
+    gateway = outlet.get("gateway") or {}
+    return gateway.get("gateway_status") != "offline"
+
+
+async def _outlet_health_for_switch(hass: HomeAssistant, switch_entity_id: str) -> dict[str, Any] | None:
+    """Return the current public outlet snapshot for one switch."""
+    outlets = await _public_outlet_data(hass)
+    return next((outlet for outlet in outlets if outlet.get("id") == switch_entity_id), None)
+
+
 async def _public_outlet_data(hass: HomeAssistant) -> list[dict[str, Any]]:
     """Return outlet data for the unauthenticated public portal."""
     options = _public_options(hass)
@@ -667,21 +932,58 @@ async def _public_outlet_data(hass: HomeAssistant) -> list[dict[str, Any]]:
     billing = _billing_report(hass, await _async_load_billing(hass))
     active_sessions = {session["switch_entity_id"]: session for session in billing["active"]}
     settings = billing["settings"]
+    hierarchy = await async_load_hierarchy_manager(hass)
+    outlet_mappings = {
+        record.get("switch_entity_id"): record
+        for record in hierarchy.list_records(include_archived=False).get("outlet_mappings", [])
+        if record.get("switch_entity_id")
+    }
 
     outlets = []
     for state in hass.states.async_all("switch"):
         entity_id = state.entity_id
         entity_entry = entity_registry.async_get(entity_id)
-        if not _is_managed_switch(entity_id, entity_entry, state, entity_filter):
+        mapping = outlet_mappings.get(entity_id, {})
+        if not mapping and not _is_managed_switch(entity_id, entity_entry, state, entity_filter):
             continue
         device_id = getattr(entity_entry, "device_id", None) if entity_entry is not None else None
         device_entry = device_registry.async_get(device_id) if device_id else None
         area_entry = _area_for_entity(entity_entry, device_entry, area_registry)
         floor_entry = _floor_for_area(area_entry, floor_registry)
         labels = _label_entries(label_registry, list(getattr(entity_entry, "labels", []) or []))
-        power_entity_id, power_state = _best_device_sensor(hass, entity_registry, device_id, kind="power")
-        energy_entity_id, energy_state = _best_device_sensor(hass, entity_registry, device_id, kind="energy")
+        power_entity_id, power_state = _mapped_or_best_sensor(
+            hass,
+            entity_registry,
+            device_id,
+            mapping.get("power_entity_id"),
+            kind="power",
+        )
+        energy_entity_id, energy_state = _mapped_or_best_sensor(
+            hass,
+            entity_registry,
+            device_id,
+            mapping.get("energy_entity_id"),
+            kind="energy",
+        )
+        availability_state = hass.states.get(str(mapping.get("availability_entity_id") or ""))
+        rssi_state = hass.states.get(str(mapping.get("rssi_entity_id") or ""))
         energy_kwh = _normalise_energy_kwh(energy_state)
+        stale_minutes = int(float(mapping.get("stale_after_minutes") or DEFAULT_STALE_AFTER_MINUTES))
+        connectivity = _outlet_connectivity(
+            switch_state=state,
+            power_state=power_state,
+            energy_state=energy_state,
+            availability_state=availability_state,
+            rssi_state=rssi_state,
+            mapping=mapping,
+            stale_after_minutes=stale_minutes,
+        )
+        gateway = _gateway_snapshot(hass, mapping)
+        if gateway and gateway.get("gateway_status") == "offline":
+            connectivity["state"] = "gateway_unreachable"
+            connectivity["is_stale"] = True
+        if connectivity["is_stale"]:
+            energy_kwh = None
         active_session = active_sessions.get(entity_id)
         reference = (
             log_data.get("active_references", {}).get(entity_id)
@@ -694,16 +996,25 @@ async def _public_outlet_data(hass: HomeAssistant) -> list[dict[str, Any]]:
                 "id": entity_id,
                 "name": _state_name(state, entity_id),
                 "state": state.state,
+                "connectivity_state": connectivity["state"],
+                "outlet_last_seen": connectivity["outlet_last_seen"],
+                "outlet_rssi": connectivity["outlet_rssi"],
+                "outlet_availability": connectivity["outlet_availability"],
+                "stale_after_minutes": stale_minutes,
+                "mqtt_topic_prefix": mapping.get("mqtt_topic_prefix", ""),
+                "source_type": mapping.get("source_type") or _source_type_for_entry(entity_entry),
                 "reference": reference,
-                "area": _entry_name(area_entry) or "Unassigned",
-                "level": _entry_name(floor_entry) or _entry_name(area_entry) or "Unassigned",
+                "area": mapping.get("area") or _entry_name(area_entry) or "Unassigned",
+                "level": mapping.get("level") or _entry_name(floor_entry) or _entry_name(area_entry) or "Unassigned",
+                "bay": mapping.get("bay", ""),
                 "labels": [_entry_name(label) for label in labels if _entry_name(label)],
                 "power_entity_id": power_entity_id,
-                "power_w": _normalise_power_w(power_state),
+                "power_w": None if connectivity["is_stale"] else _normalise_power_w(power_state),
                 "energy_entity_id": energy_entity_id,
                 "energy_kwh": energy_kwh,
-                "meter_cost": _session_cost(energy_kwh, rate),
+                "meter_cost": None if connectivity["is_stale"] else _session_cost(energy_kwh, rate),
                 "session": active_session,
+                "gateway": gateway,
             }
         )
     return sorted(outlets, key=lambda outlet: outlet["name"])
@@ -761,8 +1072,12 @@ async def _public_billing_report(hass: HomeAssistant, period: str) -> dict[str, 
         "cost": round(sum(float(session.get("cost") or 0) for session in report["active"]), 4),
     }
     meter_summary = await _public_summary(hass)
+    public_settings = {
+        "energy_rate": report["settings"].get("energy_rate", DEFAULT_ENERGY_RATE),
+        "currency": report["settings"].get("currency", "AUD"),
+    }
     return {
-        "settings": report["settings"],
+        "settings": public_settings,
         "period": period,
         "active": report["active"],
         "completed": completed,
@@ -828,6 +1143,18 @@ async def _public_control_http_handler(
     if action == "turn_on" and not reference:
         return web.json_response({"error": "Reference is required before powering an outlet on"}, status=400)
     outlet_name = str(body.get("outlet_name", "")).strip() or entity_id
+    if action == "turn_on":
+        outlet_health = await _outlet_health_for_switch(hass, entity_id)
+        if outlet_health and not _can_start_session_from_health(outlet_health):
+            return web.json_response(
+                {
+                    "error": (
+                        "Outlet telemetry is offline, stale, or gateway unreachable; "
+                        "ParkPower will not start a billing session from stale data"
+                    )
+                },
+                status=409,
+            )
     try:
         await hass.services.async_call("switch", action, {"entity_id": entity_id}, blocking=True)
         event = await _async_log_outlet_event(
@@ -1017,7 +1344,10 @@ async def _websocket_get_billing_report(
     msg: dict[str, Any],
 ) -> None:
     """Return persisted billing/session report data."""
-    connection.send_result(msg["id"], _billing_report(hass, await _async_load_billing(hass)))
+    report = _billing_report(hass, await _async_load_billing(hass))
+    if not connection.user.is_admin:
+        report.pop("statements", None)
+    connection.send_result(msg["id"], report)
 
 
 @websocket_api.websocket_command(
@@ -1057,8 +1387,11 @@ async def _websocket_get_management_report(
         vol.Required("type"): "pow_reporting/save_billing_settings",
         vol.Optional("energy_rate", default=DEFAULT_ENERGY_RATE): vol.Coerce(float),
         vol.Optional("currency", default="AUD"): cv.string,
+        vol.Optional("notify_service", default=""): cv.string,
+        vol.Optional("sender_name", default="ParkPower"): cv.string,
     }
 )
+@websocket_api.require_admin
 @websocket_api.async_response
 async def _websocket_save_billing_settings(
     hass: HomeAssistant,
@@ -1072,9 +1405,118 @@ async def _websocket_save_billing_settings(
         **data["settings"],
         "energy_rate": energy_rate,
         "currency": msg["currency"].strip() or "AUD",
+        "notify_service": msg["notify_service"].strip(),
+        "sender_name": msg["sender_name"].strip() or "ParkPower",
     }
     await _async_save_billing(hass, data)
     connection.send_result(msg["id"], _billing_report(hass, data))
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "pow_reporting/create_tenant_statement",
+        vol.Required("customer_id"): cv.string,
+        vol.Required("period_start"): cv.string,
+        vol.Required("period_end"): cv.string,
+        vol.Optional("rate_per_kwh"): vol.Coerce(float),
+        vol.Optional("include_invoiced", default=False): cv.boolean,
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def _websocket_create_tenant_statement(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Create and persist an email-ready tenant statement."""
+    data = await _async_load_billing(hass)
+    records = await async_load_records_manager(hass)
+    manager = TenantBillingManager(data, records.dump())
+    try:
+        statement = manager.create_statement(
+            customer_id=msg["customer_id"],
+            period_start=msg["period_start"],
+            period_end=msg["period_end"],
+            rate_per_kwh=msg.get("rate_per_kwh"),
+            include_invoiced=msg["include_invoiced"],
+        )
+    except ValueError as err:
+        connection.send_error(msg["id"], "invalid_statement", str(err))
+        return
+    await _async_save_billing(hass, manager.dump())
+    connection.send_result(msg["id"], {"statement": statement})
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "pow_reporting/send_tenant_statement",
+        vol.Required("statement_id"): cv.string,
+        vol.Optional("notify_service", default=""): cv.string,
+        vol.Optional("recipient", default=""): cv.string,
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def _websocket_send_tenant_statement(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Email a statement with an auditable delivery result."""
+    data = await _async_load_billing(hass)
+    records = await async_load_records_manager(hass)
+    manager = TenantBillingManager(data, records.dump())
+    try:
+        statement = manager.validate_send(msg["statement_id"])
+    except ValueError as err:
+        connection.send_error(msg["id"], "statement_not_sendable", str(err))
+        return
+
+    notify_service = (msg["notify_service"] or data["settings"].get("notify_service", "")).strip()
+    notify_service = notify_service.removeprefix("notify.")
+    recipient = (msg["recipient"] or statement.get("email_to") or "").strip()
+    if not notify_service:
+        connection.send_error(msg["id"], "notify_service_required", "Configure an email notify service")
+        return
+    if not recipient:
+        connection.send_error(msg["id"], "recipient_required", "Tenant email is required")
+        return
+    if not hass.services.has_service("notify", notify_service):
+        connection.send_error(
+            msg["id"],
+            "notify_service_not_found",
+            f"Home Assistant service notify.{notify_service} was not found",
+        )
+        return
+
+    error = ""
+    try:
+        await hass.services.async_call(
+            "notify",
+            notify_service,
+            {
+                "target": [recipient],
+                "title": statement["email_subject"],
+                "message": statement["email_body"],
+            },
+            blocking=True,
+        )
+    except Exception as err:  # noqa: BLE001 - stored and returned to the admin
+        error = str(err)
+
+    statement = manager.record_delivery(
+        statement_id=msg["statement_id"],
+        notify_service=notify_service,
+        recipient=recipient,
+        success=not error,
+        error=error,
+    )
+    await _async_save_billing(hass, manager.dump())
+    if error:
+        connection.send_error(msg["id"], "email_delivery_failed", error)
+        return
+    connection.send_result(msg["id"], {"statement": statement})
 
 
 @websocket_api.websocket_command(
@@ -1084,6 +1526,7 @@ async def _websocket_save_billing_settings(
         vol.Required("action"): vol.In(["turn_on", "turn_off"]),
         vol.Optional("reference", default=""): cv.string,
         vol.Optional("outlet_name", default=""): cv.string,
+        vol.Optional("customer_id", default=""): cv.string,
     }
 )
 @websocket_api.async_response
@@ -1097,6 +1540,25 @@ async def _websocket_control_outlet(
     action = msg["action"]
     reference = msg["reference"].strip()
     outlet_name = msg["outlet_name"].strip() or switch_entity_id
+    customer_id = msg["customer_id"].strip()
+    if action == "turn_on":
+        outlet_health = await _outlet_health_for_switch(hass, switch_entity_id)
+        if outlet_health and not _can_start_session_from_health(outlet_health):
+            event = await _async_log_outlet_event(
+                hass,
+                switch_entity_id=switch_entity_id,
+                action=action,
+                reference=reference,
+                outlet_name=outlet_name,
+                success=False,
+                error="Outlet telemetry is offline, stale, or gateway unreachable",
+            )
+            connection.send_error(
+                msg["id"],
+                "stale_outlet_telemetry",
+                "Outlet telemetry is offline, stale, or gateway unreachable; ParkPower will not start a billing session",
+            )
+            return
 
     try:
         await hass.services.async_call(
@@ -1133,6 +1595,7 @@ async def _websocket_control_outlet(
         reference=reference,
         outlet_name=outlet_name,
         event=event,
+        customer_id=customer_id,
     )
     connection.send_result(msg["id"], {"event": event})
 

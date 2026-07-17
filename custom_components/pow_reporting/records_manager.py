@@ -84,11 +84,40 @@ class RecordsManager:
             "updated_at": now,
         }
         record = model.from_dict(payload)
+        if record_type == "customer":
+            self._validate_outlet_assignments(record)
         if existing_index is None:
             collection.append(record)
         else:
             collection[existing_index] = record
         return record.as_dict()
+
+    def customer_for_outlet(self, outlet_entity_id: str) -> CustomerRecord | None:
+        """Return the active customer explicitly assigned to an outlet."""
+        return next(
+            (
+                customer
+                for customer in self.customers
+                if customer.status == RecordStatus.ACTIVE
+                and outlet_entity_id in customer.outlet_entity_ids
+            ),
+            None,
+        )
+
+    def _validate_outlet_assignments(self, candidate: CustomerRecord) -> None:
+        """Prevent ambiguous ownership of an outlet by active customers."""
+        if candidate.status != RecordStatus.ACTIVE:
+            return
+        assigned = set(candidate.outlet_entity_ids)
+        for customer in self.customers:
+            if customer.id == candidate.id or customer.status != RecordStatus.ACTIVE:
+                continue
+            duplicate = assigned.intersection(customer.outlet_entity_ids)
+            if duplicate:
+                outlet = sorted(duplicate)[0]
+                raise ValueError(
+                    f"{outlet} is already assigned to {customer.display_name or customer.id}"
+                )
 
     def archive(self, record_type: str, record_id: str) -> dict[str, Any] | None:
         """Archive a record without deleting historic references."""
@@ -141,6 +170,9 @@ def _clean_fields(record_type: str, fields: dict[str, Any]) -> dict[str, Any]:
             "contact_telephone",
             "apartment_unit_company",
             "billing_reference",
+            "outlet_entity_ids",
+            "billing_rate_per_kwh",
+            "billing_currency",
             "user_group",
             "status",
             "notes",

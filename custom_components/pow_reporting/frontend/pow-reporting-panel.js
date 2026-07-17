@@ -57,6 +57,11 @@ function htmlEscape(value) {
     .replaceAll('"', "&quot;");
 }
 
+function dateInputValue(date) {
+  const offset = date.getTimezoneOffset() * 60000;
+  return new Date(date.getTime() - offset).toISOString().slice(0, 10);
+}
+
 class PowReportingPanel extends HTMLElement {
   constructor() {
     super();
@@ -86,8 +91,17 @@ class PowReportingPanel extends HTMLElement {
     this._period = "day";
     this._billingPeriod = "day";
     this._billingReport = { settings: { energy_rate: 0.32, currency: "AUD" }, active: [], completed: [], sessions: [] };
+    const now = new Date();
+    this._billingCustomerId = "";
+    this._billingStart = dateInputValue(new Date(now.getFullYear(), now.getMonth(), 1));
+    this._billingEnd = dateInputValue(now);
+    this._billingBusy = false;
     this._managementReport = { kpis: {}, charts: {}, statement: {}, sessions: [] };
     this._managementMessage = "";
+    this._reportGatewayFilter = "";
+    this._reportZoneFilter = "";
+    this._reportConnectivityFilter = "";
+    this._reportStaleOfflineFilter = false;
     this._billingMessage = "";
     this._portalQuery = "";
     this._panelMode = "admin";
@@ -223,6 +237,7 @@ class PowReportingPanel extends HTMLElement {
         active: Array.isArray(data?.active) ? data.active : [],
         completed: Array.isArray(data?.completed) ? data.completed : [],
         sessions: Array.isArray(data?.sessions) ? data.sessions : [],
+        statements: Array.isArray(data?.statements) ? data.statements : [],
       };
       this._requestRender();
     } catch (err) {
@@ -249,10 +264,18 @@ class PowReportingPanel extends HTMLElement {
     const reference = this.shadowRoot?.querySelector("#report-reference-filter")?.value?.trim() || "";
     const outlet = this.shadowRoot?.querySelector("#report-outlet-filter")?.value || "";
     const billingStatus = this.shadowRoot?.querySelector("#report-billing-filter")?.value || "";
+    const gateway = this.shadowRoot?.querySelector("#report-gateway-filter")?.value?.trim() || this._reportGatewayFilter || "";
+    const zone = this.shadowRoot?.querySelector("#report-zone-filter")?.value?.trim() || this._reportZoneFilter || "";
+    const connectivity = this.shadowRoot?.querySelector("#report-connectivity-filter")?.value || this._reportConnectivityFilter || "";
+    const staleOffline = this.shadowRoot?.querySelector("#report-stale-offline-filter")?.checked ?? this._reportStaleOfflineFilter;
     return {
       ...(reference ? { reference } : {}),
       ...(outlet ? { outlet } : {}),
       ...(billingStatus ? { billing_status: billingStatus } : {}),
+      ...(gateway ? { gateway } : {}),
+      ...(zone ? { zone } : {}),
+      ...(connectivity ? { connectivity } : {}),
+      ...(staleOffline ? { stale_offline: true } : {}),
     };
   }
 
@@ -325,11 +348,13 @@ class PowReportingPanel extends HTMLElement {
       .sort((a, b) => a.name.localeCompare(b.name));
 
     const sensorRows = this._entities;
+    const mappingBySwitch = new Map((this._hierarchy?.outlet_mappings || []).map((record) => [record.switch_entity_id, record]));
     this._outlets = Object.values(this._hass.states)
       .filter((entity) => entity.entity_id.startsWith("switch."))
       .map((entity) => {
         const registry = this._entityRegistry.get(entity.entity_id) || {};
         const device = registry.device_id ? this._devices.get(registry.device_id) : undefined;
+        const mapping = mappingBySwitch.get(entity.entity_id) || {};
         const haystack = [
           entity.entity_id,
           entity.attributes.friendly_name,
@@ -344,20 +369,28 @@ class PowReportingPanel extends HTMLElement {
           .toLowerCase();
         const keywordMatch = keywords.length === 0 || keywords.some((keyword) => haystack.includes(keyword));
         const isControl = !/(restart|update|firmware|reboot)/.test(haystack);
-        const power = this._bestSensorForDevice(sensorRows, registry.device_id, "power");
-        const energy = this._bestSensorForDevice(sensorRows, registry.device_id, "energy");
+        const power = mapping.power_entity_id ? this._entityRowForId(mapping.power_entity_id) : this._bestSensorForDevice(sensorRows, registry.device_id, "power");
+        const energy = mapping.energy_entity_id ? this._entityRowForId(mapping.energy_entity_id) : this._bestSensorForDevice(sensorRows, registry.device_id, "energy");
+        const availability = mapping.availability_entity_id ? this._hass.states[mapping.availability_entity_id] : undefined;
+        const rssi = mapping.rssi_entity_id ? this._hass.states[mapping.rssi_entity_id] : undefined;
+        const gateway = this._gatewayForMapping(mapping);
+        const connectivity = this._connectivityForOutlet(entity, power?.entity, energy?.entity, availability, rssi, mapping, gateway);
         return {
           entity,
           registry,
           device,
+          mapping,
           keywordMatch,
           isControl,
           power,
           energy,
+          connectivity,
+          gateway,
+          sourceType: mapping.source_type || (registry.platform === "mqtt" ? "mqtt" : registry.platform === "esphome" ? "esphome_native" : "manual"),
           name: entity.attributes.friendly_name || entity.entity_id,
         };
       })
-      .filter((row) => row.keywordMatch && row.isControl)
+      .filter((row) => (row.keywordMatch || mappingBySwitch.has(row.entity.entity_id)) && row.isControl)
       .sort((a, b) => a.name.localeCompare(b.name));
 
     if (!this._selectedEntity) {
@@ -457,7 +490,16 @@ class PowReportingPanel extends HTMLElement {
     if (!this._hass?.callWS) return;
     const referenceInput = this.shadowRoot.querySelector(`[data-reference-for="${switchEntityId}"]`);
     const existingReference = this._activeReferences[switchEntityId] || "";
-    const reference = (referenceInput?.value || existingReference || "").trim();
+    const customerSelect = this.shadowRoot.querySelector(`[data-customer-for="${switchEntityId}"]`);
+    const customerId = customerSelect?.value || "";
+    const customer = (this._records?.customers || []).find((row) => row.id === customerId);
+    const reference = (
+      referenceInput?.value
+      || existingReference
+      || customer?.billing_reference
+      || customer?.display_name
+      || ""
+    ).trim();
     if (action === "turn_on" && !reference) {
       referenceInput?.focus();
       this._notice = "Enter a name, bay, or booking reference before turning an outlet on.";
@@ -475,6 +517,7 @@ class PowReportingPanel extends HTMLElement {
         action,
         reference,
         outlet_name: outletName,
+        customer_id: customerId,
       });
       await this._loadOutletLog();
       await this._loadBillingReport();
@@ -520,6 +563,13 @@ class PowReportingPanel extends HTMLElement {
   async _saveRecord(recordType, form) {
     if (!this._hass?.callWS) return;
     const fields = this._formFields(form);
+    if (recordType === "customer") {
+      fields.billing_rate_per_kwh = Number(fields.billing_rate_per_kwh || 0);
+      fields.billing_currency = (fields.billing_currency || "AUD").toUpperCase();
+      fields.outlet_entity_ids = [
+        ...(form.querySelector("[name='outlet_entity_ids']")?.selectedOptions || []),
+      ].map((option) => option.value);
+    }
     if (recordType === "user_group") {
       fields.priority = Number(fields.priority || 0);
       fields.discount_percentage = Number(fields.discount_percentage || 0);
@@ -534,6 +584,10 @@ class PowReportingPanel extends HTMLElement {
         fields,
       });
       form.reset();
+      if (recordType === "customer") {
+        const saveButton = form.querySelector("button[type='submit']");
+        if (saveButton) saveButton.textContent = "Save Customer";
+      }
       this._recordsNotice = "Record saved.";
       await this._loadRecords();
     } catch (err) {
@@ -563,6 +617,9 @@ class PowReportingPanel extends HTMLElement {
       if ("priority" in fields) fields.priority = Number(fields.priority || 0);
     }
     if (recordType === "outlet") {
+      ["gateway_uplink_rssi", "gateway_client_count", "outlet_rssi", "stale_after_minutes"].forEach((key) => {
+        if (key in fields) fields[key] = fields[key] === "" ? null : Number(fields[key]);
+      });
       const discovered = this._hierarchy.discovered_outlets?.find((item) => item.switch_entity_id === fields.switch_entity_id);
       if (discovered) {
         fields.power_entity_id ||= discovered.power_entity_id || "";
@@ -618,10 +675,40 @@ class PowReportingPanel extends HTMLElement {
     }
   }
 
+  _editCustomer(recordId) {
+    const record = (this._records?.customers || []).find((row) => row.id === recordId);
+    const form = this.shadowRoot.querySelector('[data-record-form="customer"]');
+    if (!record || !form) return;
+    for (const name of [
+      "id",
+      "display_name",
+      "contact_email",
+      "contact_telephone",
+      "apartment_unit_company",
+      "billing_reference",
+      "billing_rate_per_kwh",
+      "billing_currency",
+      "user_group",
+      "notes",
+    ]) {
+      const input = form.querySelector(`[name="${name}"]`);
+      if (input) input.value = record[name] ?? "";
+    }
+    const outlets = new Set(record.outlet_entity_ids || []);
+    form.querySelectorAll('[name="outlet_entity_ids"] option').forEach((option) => {
+      option.selected = outlets.has(option.value);
+    });
+    const saveButton = form.querySelector("button[type='submit']");
+    if (saveButton) saveButton.textContent = "Update Customer";
+    form.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
   async _saveBillingSettings() {
     if (!this._hass?.callWS) return;
     const rate = Number(this.shadowRoot.querySelector("#billing-rate")?.value);
     const currency = this.shadowRoot.querySelector("#billing-currency")?.value.trim() || "AUD";
+    const notifyService = this.shadowRoot.querySelector("#billing-notify-service")?.value.trim() || "";
+    const senderName = this.shadowRoot.querySelector("#billing-sender-name")?.value.trim() || "ParkPower";
     this._billingMessage = "";
     this._requestRender({ force: true });
     try {
@@ -629,18 +716,84 @@ class PowReportingPanel extends HTMLElement {
         type: "pow_reporting/save_billing_settings",
         energy_rate: Number.isFinite(rate) ? rate : 0,
         currency,
+        notify_service: notifyService,
+        sender_name: senderName,
       });
       this._billingReport = {
         settings: { energy_rate: 0.32, currency: "AUD", ...(data?.settings || {}) },
         active: Array.isArray(data?.active) ? data.active : [],
         completed: Array.isArray(data?.completed) ? data.completed : [],
         sessions: Array.isArray(data?.sessions) ? data.sessions : [],
+        statements: Array.isArray(data?.statements) ? data.statements : [],
       };
       await this._loadManagementReport();
       this._billingMessage = "Billing settings saved.";
     } catch (err) {
       this._billingMessage = err?.message || "Unable to save billing settings.";
     } finally {
+      this._requestRender();
+    }
+  }
+
+  async _createTenantStatement() {
+    const customerId = this.shadowRoot.querySelector("#statement-customer")?.value || "";
+    const periodStart = this.shadowRoot.querySelector("#statement-start")?.value || "";
+    const periodEnd = this.shadowRoot.querySelector("#statement-end")?.value || "";
+    const rateInput = this.shadowRoot.querySelector("#statement-rate")?.value;
+    if (!customerId || !periodStart || !periodEnd) {
+      this._billingMessage = "Select a tenant and billing period.";
+      this._requestRender({ force: true });
+      return;
+    }
+    this._billingCustomerId = customerId;
+    this._billingStart = periodStart;
+    this._billingEnd = periodEnd;
+    this._billingBusy = true;
+    this._billingMessage = "";
+    this._requestRender({ force: true });
+    try {
+      const payload = {
+        type: "pow_reporting/create_tenant_statement",
+        customer_id: customerId,
+        period_start: `${periodStart}T00:00:00`,
+        period_end: `${periodEnd}T23:59:59.999`,
+      };
+      if (rateInput !== "" && Number.isFinite(Number(rateInput))) payload.rate_per_kwh = Number(rateInput);
+      const result = await this._hass.callWS(payload);
+      const count = result?.statement?.session_count || 0;
+      this._billingMessage = `Draft statement created with ${count} session${count === 1 ? "" : "s"}.`;
+      await this._loadBillingReport();
+    } catch (err) {
+      this._billingMessage = err?.message || "Unable to create tenant statement.";
+    } finally {
+      this._billingBusy = false;
+      this._requestRender();
+    }
+  }
+
+  async _sendTenantStatement(statementId) {
+    const statement = (this._billingReport?.statements || []).find((row) => row.statement_id === statementId);
+    if (!statement) return;
+    if (!statement.email_to) {
+      this._billingMessage = "Add an email address to this tenant before sending.";
+      this._requestRender({ force: true });
+      return;
+    }
+    if (!confirm(`Email this statement to ${statement.email_to}?`)) return;
+    this._billingBusy = true;
+    this._requestRender({ force: true });
+    try {
+      await this._hass.callWS({
+        type: "pow_reporting/send_tenant_statement",
+        statement_id: statementId,
+      });
+      this._billingMessage = `Statement emailed to ${statement.email_to}.`;
+      await this._loadBillingReport();
+      await this._loadManagementReport();
+    } catch (err) {
+      this._billingMessage = err?.message || "Unable to email tenant statement.";
+    } finally {
+      this._billingBusy = false;
       this._requestRender();
     }
   }
@@ -717,6 +870,7 @@ class PowReportingPanel extends HTMLElement {
     const currency = this._billingReport.settings?.currency || "AUD";
     const rows = this._outlets
       .map((outlet) => {
+        if (outlet.connectivity?.is_stale || outlet.connectivity?.state !== "online") return null;
         const energyKwh = this._energyKwhForRow(outlet.energy);
         if (!Number.isFinite(energyKwh)) return null;
         return {
@@ -795,6 +949,24 @@ class PowReportingPanel extends HTMLElement {
     URL.revokeObjectURL(url);
   }
 
+  _entityRowForId(entityId) {
+    const entity = this._hass?.states?.[entityId];
+    if (!entity) return undefined;
+    const registry = this._entityRegistry.get(entityId) || {};
+    const device = registry.device_id ? this._devices.get(registry.device_id) : undefined;
+    const unit = entity.attributes.unit_of_measurement;
+    const deviceClass = entity.attributes.device_class;
+    return {
+      entity,
+      registry,
+      device,
+      isPower: deviceClass === "power" || POWER_UNITS.has(unit),
+      isEnergy: deviceClass === "energy" || ENERGY_UNITS.has(unit),
+      keywordMatch: true,
+      name: entity.attributes.friendly_name || entityId,
+    };
+  }
+
   _bestSensorForDevice(sensorRows, deviceId, kind) {
     const candidates = sensorRows.filter((row) => row.registry.device_id === deviceId && (kind === "energy" ? row.isEnergy : row.isPower));
     if (!candidates.length) return undefined;
@@ -819,6 +991,80 @@ class PowReportingPanel extends HTMLElement {
     return score;
   }
 
+  _stateTimestamp(entity) {
+    const value = entity?.last_updated || entity?.last_changed;
+    const time = value ? new Date(value).getTime() : NaN;
+    return Number.isFinite(time) ? time : null;
+  }
+
+  _stateIsOnline(entity) {
+    if (!entity) return undefined;
+    const state = String(entity.state || "").toLowerCase();
+    if (["on", "online", "home", "connected", "true", "1"].includes(state)) return true;
+    if (["off", "offline", "not_home", "disconnected", "false", "0", "unavailable", "unknown"].includes(state)) return false;
+    return undefined;
+  }
+
+  _entityNumber(entity) {
+    const value = Number(entity?.state);
+    return Number.isFinite(value) ? value : null;
+  }
+
+  _gatewayEntityId(mapping, suffix, domain = "sensor") {
+    const explicit = mapping?.[`gateway_${suffix}_entity_id`];
+    if (explicit) return explicit;
+    const base = String(mapping?.gateway_id || mapping?.gateway_name || "").trim().toLowerCase().replaceAll(" ", "_").replaceAll("-", "_");
+    return base ? `${domain}.${base}_${suffix}` : "";
+  }
+
+  _gatewayForMapping(mapping = {}) {
+    if (!mapping.gateway_id && !mapping.gateway_name) return null;
+    const online = this._hass?.states?.[this._gatewayEntityId(mapping, "online", "binary_sensor")];
+    const uptime = this._hass?.states?.[this._gatewayEntityId(mapping, "uptime")];
+    const clientCount = this._entityNumber(this._hass?.states?.[this._gatewayEntityId(mapping, "client_count")]);
+    const uplinkRssi = this._entityNumber(this._hass?.states?.[this._gatewayEntityId(mapping, "uplink_rssi")]);
+    const freeHeap = this._entityNumber(this._hass?.states?.[this._gatewayEntityId(mapping, "free_heap")]);
+    const onlineState = this._stateIsOnline(online);
+    return {
+      gateway_id: mapping.gateway_id || "",
+      gateway_name: mapping.gateway_name || mapping.gateway_id || "",
+      gateway_zone: mapping.gateway_zone || "",
+      gateway_ip: mapping.gateway_ip || "",
+      gateway_ssid: mapping.gateway_ssid || "",
+      gateway_subnet: mapping.gateway_subnet || "",
+      gateway_last_seen: mapping.gateway_last_seen || online?.last_updated || uptime?.last_updated || "",
+      gateway_uplink_rssi: uplinkRssi ?? Number(mapping.gateway_uplink_rssi),
+      gateway_client_count: clientCount ?? Number(mapping.gateway_client_count),
+      gateway_status: onlineState === false ? "offline" : mapping.gateway_status || (onlineState === true ? "online" : "unknown"),
+      gateway_uptime: uptime?.state || "",
+      gateway_free_heap: freeHeap,
+    };
+  }
+
+  _connectivityForOutlet(switchEntity, powerEntity, energyEntity, availabilityEntity, rssiEntity, mapping = {}, gateway = null) {
+    const staleMinutes = Number(mapping.stale_after_minutes || 15);
+    const cutoffMs = Date.now() - staleMinutes * 60 * 1000;
+    const telemetryTimes = [powerEntity, energyEntity].map((entity) => this._stateTimestamp(entity)).filter(Number.isFinite);
+    const lastSeen = mapping.outlet_last_seen || (telemetryTimes.length ? new Date(Math.max(...telemetryTimes)).toISOString() : switchEntity.last_updated || "");
+    let online = this._stateIsOnline(availabilityEntity);
+    if (online === undefined) online = !["unavailable", "unknown", ""].includes(String(switchEntity?.state || "").toLowerCase());
+    const manualAvailability = String(mapping.outlet_availability || "").toLowerCase();
+    if (["online", "available"].includes(manualAvailability)) online = true;
+    if (["offline", "unavailable"].includes(manualAvailability)) online = false;
+    const isStale = telemetryTimes.length ? telemetryTimes.every((time) => time < cutoffMs) : Boolean(this._stateTimestamp(switchEntity) && this._stateTimestamp(switchEntity) < cutoffMs);
+    let state = online === false ? "offline" : isStale ? "stale" : "online";
+    if (gateway?.gateway_status === "offline") state = "gateway_unreachable";
+    const rssi = this._entityNumber(rssiEntity) ?? Number(mapping.outlet_rssi);
+    return {
+      state,
+      outlet_last_seen: lastSeen,
+      outlet_rssi: Number.isFinite(rssi) ? rssi : null,
+      outlet_availability: online === false ? "offline" : "online",
+      stale_after_minutes: staleMinutes,
+      is_stale: ["stale", "gateway_unreachable"].includes(state),
+    };
+  }
+
   _liveSessionDuration(session) {
     if (!session?.start_time) return session?.duration_seconds;
     const start = new Date(session.start_time).getTime();
@@ -828,6 +1074,7 @@ class PowReportingPanel extends HTMLElement {
 
   _liveSessionCost(session, outlet) {
     if (!session) return null;
+    if (outlet?.connectivity?.is_stale || outlet?.connectivity?.state !== "online") return null;
     const startEnergy = Number(session.start_energy_kwh);
     const currentEnergy = this._energyKwhForRow(outlet.energy);
     if (Number.isFinite(startEnergy) && Number.isFinite(currentEnergy)) {
@@ -874,8 +1121,9 @@ class PowReportingPanel extends HTMLElement {
   }
 
   _totals() {
-    const powerWatts = this._entities
-      .filter((row) => row.isPower)
+    const powerWatts = this._outlets
+      .filter((row) => row.connectivity?.state === "online" && row.power)
+      .map((row) => row.power)
       .reduce((total, row) => {
         const value = Number(row.entity.state);
         if (!Number.isFinite(value)) return total;
@@ -936,6 +1184,7 @@ class PowReportingPanel extends HTMLElement {
             ${this._tabButton("dashboard", "Dashboard")}
             ${this._tabButton("outlets", "Outlets")}
             ${this._tabButton("reports", "Reports")}
+            ${this._hass?.user?.is_admin ? this._tabButton("billing", "Billing") : ""}
             ${this._tabButton("records", "Records")}
             ${this._tabButton("hierarchy", "Hierarchy")}
             ${this._tabButton("settings", "Settings")}
@@ -946,6 +1195,7 @@ class PowReportingPanel extends HTMLElement {
         ${!isPortal && this._activeTab === "dashboard" ? this._dashboard(totals, powerRows, energyRows) : ""}
         ${!isPortal && this._activeTab === "outlets" ? this._outletsView() : ""}
         ${!isPortal && this._activeTab === "reports" ? this._reports() : ""}
+        ${!isPortal && this._activeTab === "billing" ? this._tenantBillingView() : ""}
         ${!isPortal && this._activeTab === "records" ? this._recordsView() : ""}
         ${!isPortal && this._activeTab === "hierarchy" ? this._hierarchyView() : ""}
         ${!isPortal && this._activeTab === "settings" ? this._settingsView() : ""}
@@ -981,11 +1231,29 @@ class PowReportingPanel extends HTMLElement {
       this._loadManagementReport();
       this._render();
     });
-    this.shadowRoot.querySelector("#refresh-management-report")?.addEventListener("click", () => this._loadManagementReport());
+    this.shadowRoot.querySelectorAll("#refresh-management-report").forEach((button) => {
+      button.addEventListener("click", () => this._loadManagementReport());
+    });
     this.shadowRoot.querySelectorAll("[data-management-filter]").forEach((input) => {
-      input.addEventListener("change", () => this._loadManagementReport());
+      input.addEventListener("change", () => {
+        this._reportGatewayFilter = this.shadowRoot.querySelector("#report-gateway-filter")?.value?.trim() || "";
+        this._reportZoneFilter = this.shadowRoot.querySelector("#report-zone-filter")?.value?.trim() || "";
+        this._reportConnectivityFilter = this.shadowRoot.querySelector("#report-connectivity-filter")?.value || "";
+        this._reportStaleOfflineFilter = this.shadowRoot.querySelector("#report-stale-offline-filter")?.checked || false;
+        this._loadManagementReport();
+      });
     });
     this.shadowRoot.querySelector("#save-billing-settings")?.addEventListener("click", () => this._saveBillingSettings());
+    this.shadowRoot.querySelector("#create-tenant-statement")?.addEventListener("click", () => this._createTenantStatement());
+    this.shadowRoot.querySelector("#statement-customer")?.addEventListener("change", (event) => {
+      this._billingCustomerId = event.target.value;
+      const customer = (this._records?.customers || []).find((row) => row.id === event.target.value);
+      const input = this.shadowRoot.querySelector("#statement-rate");
+      if (input) input.value = customer?.billing_rate_per_kwh || "";
+    });
+    this.shadowRoot.querySelectorAll("[data-send-statement]").forEach((button) => {
+      button.addEventListener("click", () => this._sendTenantStatement(button.dataset.sendStatement));
+    });
     this.shadowRoot.querySelector("#portal-search")?.addEventListener("input", (event) => {
       this._portalQuery = event.target.value;
       this._requestRender();
@@ -1005,6 +1273,9 @@ class PowReportingPanel extends HTMLElement {
       button.addEventListener("click", () => {
         this._archiveRecord(button.dataset.recordType, button.dataset.recordId);
       });
+    });
+    this.shadowRoot.querySelectorAll("[data-edit-customer]").forEach((button) => {
+      button.addEventListener("click", () => this._editCustomer(button.dataset.editCustomer));
     });
     this.shadowRoot.querySelector("#hierarchy-search")?.addEventListener("input", (event) => {
       this._hierarchyQuery = event.target.value;
@@ -1060,6 +1331,7 @@ class PowReportingPanel extends HTMLElement {
         <article><span>Session energy</span><strong>${htmlEscape(formatEnergyKwh(billingTotals.energy, "kWh"))}</strong></article>
         <article><span>Session cost</span><strong>${htmlEscape(formatCurrency(billingTotals.cost, currency))}</strong></article>
       </section>
+      ${this._networkHealthSection()}
       ${this._registryError ? `<p class="notice">${this._registryError}</p>` : ""}
       <section class="columns">
         <div>
@@ -1071,6 +1343,89 @@ class PowReportingPanel extends HTMLElement {
           <div class="table">${energyRows.map((row) => this._entityRow(row, formatEnergyKwh(row.entity.state, row.entity.attributes.unit_of_measurement))).join("") || `<div class="empty">No matching energy sensors found.</div>`}</div>
         </div>
       </section>
+    `;
+  }
+
+  _networkHealthSection() {
+    const gateways = this._managementReport?.gateways || this._gatewayRowsFromOutlets();
+    const diagnostics = this._managementReport?.diagnostics || this._diagnosticsFromOutlets();
+    const online = this._outlets.filter((outlet) => outlet.connectivity?.state === "online").length;
+    const stale = this._outlets.filter((outlet) => outlet.connectivity?.state === "stale").length;
+    const offline = this._outlets.filter((outlet) => ["offline", "gateway_unreachable"].includes(outlet.connectivity?.state)).length;
+    return `
+      <section class="billing-card network-health">
+        <div class="section-head">
+          <div>
+            <h2>Network Health</h2>
+            <p>Gateway, MQTT, and stale telemetry status for large car park deployments.</p>
+          </div>
+          <button id="refresh-management-report">Refresh</button>
+        </div>
+        <section class="billing-summary">
+          <article><span>Gateways</span><strong>${gateways.length}</strong></article>
+          <article><span>Online outlets</span><strong>${online}</strong></article>
+          <article><span>Stale outlets</span><strong>${stale}</strong></article>
+          <article><span>Offline outlets</span><strong>${offline}</strong></article>
+        </section>
+        <div class="network-grid">
+          <div class="network-table">
+            ${gateways.length ? gateways.map((gateway) => `
+              <div class="network-row">
+                <strong>${htmlEscape(gateway.gateway_name || gateway.gateway_id || "Gateway")}</strong>
+                <span>${htmlEscape(gateway.gateway_zone || gateway.gateway_ip || "")}</span>
+                <b class="${gateway.gateway_status === "offline" ? "event-off" : "event-on"}">${htmlEscape(gateway.gateway_status || "unknown")}</b>
+                <small>${htmlEscape(formatNumber(gateway.gateway_client_count, 0))} clients · ${htmlEscape(formatNumber(gateway.gateway_uplink_rssi, 0))} dBm</small>
+              </div>
+            `).join("") : `<div class="empty">No gateway mappings yet.</div>`}
+          </div>
+          <div class="diagnostic-list">
+            ${this._diagnosticBucket("No gateway mapping", diagnostics.outlets_with_no_gateway_mapping)}
+            ${this._diagnosticBucket("Too many clients", diagnostics.gateways_with_too_many_clients, true)}
+            ${this._diagnosticBucket("Weak outlet RSSI", diagnostics.weak_rssi_outlets)}
+            ${this._diagnosticBucket("Offline or stale", diagnostics.offline_stale_outlets)}
+            ${this._diagnosticBucket("Weak uplink RSSI", diagnostics.gateways_with_weak_uplink_rssi, true)}
+            ${this._diagnosticBucket("NAT / MQTT Sonoffs", diagnostics.sonoffs_connected_through_nat_mqtt)}
+          </div>
+        </div>
+      </section>
+    `;
+  }
+
+  _gatewayRowsFromOutlets() {
+    const rows = new Map();
+    this._outlets.forEach((outlet) => {
+      const gateway = outlet.gateway;
+      const id = gateway?.gateway_id || gateway?.gateway_name;
+      if (!id) return;
+      if (!rows.has(id)) rows.set(id, { ...gateway, outlet_count: 0, offline_outlets: 0, stale_outlets: 0, mqtt_outlets: 0 });
+      const row = rows.get(id);
+      row.outlet_count += 1;
+      if (["offline", "gateway_unreachable"].includes(outlet.connectivity?.state)) row.offline_outlets += 1;
+      if (outlet.connectivity?.state === "stale") row.stale_outlets += 1;
+      if (outlet.sourceType === "mqtt") row.mqtt_outlets += 1;
+    });
+    return [...rows.values()].sort((a, b) => String(a.gateway_name || a.gateway_id).localeCompare(String(b.gateway_name || b.gateway_id)));
+  }
+
+  _diagnosticsFromOutlets() {
+    return {
+      outlets_with_no_gateway_mapping: this._outlets.filter((outlet) => !outlet.gateway?.gateway_id && !outlet.gateway?.gateway_name),
+      gateways_with_too_many_clients: this._gatewayRowsFromOutlets().filter((gateway) => Number(gateway.gateway_client_count) > 12),
+      weak_rssi_outlets: this._outlets.filter((outlet) => Number(outlet.connectivity?.outlet_rssi) < -75),
+      offline_stale_outlets: this._outlets.filter((outlet) => ["offline", "stale", "gateway_unreachable"].includes(outlet.connectivity?.state)),
+      gateways_with_weak_uplink_rssi: this._gatewayRowsFromOutlets().filter((gateway) => Number(gateway.gateway_uplink_rssi) < -70),
+      sonoffs_connected_through_nat_mqtt: this._outlets.filter((outlet) => outlet.sourceType === "mqtt" || outlet.mapping?.mqtt_topic_prefix),
+    };
+  }
+
+  _diagnosticBucket(label, rows = [], gatewayRows = false) {
+    const list = Array.isArray(rows) ? rows : [];
+    return `
+      <div class="diagnostic-bucket">
+        <span>${htmlEscape(label)}</span>
+        <strong>${list.length}</strong>
+        <small>${htmlEscape(list.slice(0, 3).map((row) => gatewayRows ? (row.gateway_name || row.gateway_id) : (row.name || row.id)).filter(Boolean).join(", "))}</small>
+      </div>
     `;
   }
 
@@ -1109,8 +1464,9 @@ class PowReportingPanel extends HTMLElement {
     const switchEntityId = outlet.entity.entity_id;
     const isOn = outlet.entity.state === "on";
     const session = (this._billingReport.active || []).find((item) => item.switch_entity_id === switchEntityId);
-    const power = outlet.power ? formatPowerWatts(outlet.power.entity) : "--";
-    const energy = outlet.energy ? formatEnergyKwh(outlet.energy.entity.state, outlet.energy.entity.attributes.unit_of_measurement) : "--";
+    const power = outlet.connectivity?.is_stale ? "--" : outlet.power ? formatPowerWatts(outlet.power.entity) : "--";
+    const energy = outlet.connectivity?.is_stale ? "--" : outlet.energy ? formatEnergyKwh(outlet.energy.entity.state, outlet.energy.entity.attributes.unit_of_measurement) : "--";
+    const connectivityLabel = outlet.connectivity?.state?.replaceAll("_", " ") || "online";
     return `
       <article class="portal-card ${isOn ? "is-on" : ""}">
         <div class="charge-visual">
@@ -1123,7 +1479,7 @@ class PowReportingPanel extends HTMLElement {
             <h2>${htmlEscape(outlet.name)}</h2>
             <p>${htmlEscape(session?.reference || outlet.device?.name_by_user || switchEntityId)}</p>
           </div>
-          <span class="status">${isOn ? "Charging" : "Inactive"}</span>
+          <span class="status ${outlet.connectivity?.state !== "online" ? "status-warn" : ""}">${htmlEscape(connectivityLabel)}</span>
         </div>
         <div class="meter-row">
           <span><b>${htmlEscape(power)}</b><small>Live load</small></span>
@@ -1176,10 +1532,15 @@ class PowReportingPanel extends HTMLElement {
     const isOn = outlet.entity.state === "on";
     const busy = this._busySwitches.has(switchEntityId);
     const activeReference = this._activeReferences[switchEntityId] || "";
-    const power = outlet.power ? formatPowerWatts(outlet.power.entity) : "--";
-    const energy = outlet.energy ? formatEnergyKwh(outlet.energy.entity.state, outlet.energy.entity.attributes.unit_of_measurement) : "--";
+    const power = outlet.connectivity?.is_stale ? "--" : outlet.power ? formatPowerWatts(outlet.power.entity) : "--";
+    const energy = outlet.connectivity?.is_stale ? "--" : outlet.energy ? formatEnergyKwh(outlet.energy.entity.state, outlet.energy.entity.attributes.unit_of_measurement) : "--";
     const activeSession = (this._billingReport.active || []).find((session) => session.switch_entity_id === switchEntityId);
-    const status = isOn ? "On" : "Off";
+    const connectivityLabel = outlet.connectivity?.state?.replaceAll("_", " ") || "online";
+    const status = outlet.connectivity?.state !== "online" ? connectivityLabel : isOn ? "On" : "Off";
+    const canStart = outlet.connectivity?.state === "online";
+    const gatewayName = outlet.gateway?.gateway_name || outlet.gateway?.gateway_id || "No gateway";
+    const customers = this._records?.customers || [];
+    const assignedCustomer = customers.find((row) => (row.outlet_entity_ids || []).includes(switchEntityId));
     return `
       <article class="outlet-card ${isOn ? "is-on" : ""}">
         <div class="outlet-top">
@@ -1187,7 +1548,7 @@ class PowReportingPanel extends HTMLElement {
             <h2>${htmlEscape(outlet.name)}</h2>
             <p>${htmlEscape(switchEntityId)}</p>
           </div>
-          <span class="status">${status}</span>
+          <span class="status ${outlet.connectivity?.state !== "online" ? "status-warn" : ""}">${htmlEscape(status)}</span>
         </div>
         <div class="meter-row">
           <span><b>${htmlEscape(power)}</b><small>Live load</small></span>
@@ -1195,6 +1556,17 @@ class PowReportingPanel extends HTMLElement {
           <span><b>${activeSession ? htmlEscape(formatDuration(this._liveSessionDuration(activeSession))) : "--"}</b><small>Charging for</small></span>
           <span><b>${activeSession ? htmlEscape(this._formatLiveSessionCost(activeSession, outlet)) : "--"}</b><small>Session cost</small></span>
         </div>
+        <div class="connectivity-row">
+          <span><b>${htmlEscape(gatewayName)}</b><small>${htmlEscape(outlet.gateway?.gateway_zone || outlet.mapping?.gateway_zone || "Gateway")}</small></span>
+          <span><b>${htmlEscape(formatNumber(outlet.connectivity?.outlet_rssi, 0))} dBm</b><small>${htmlEscape(outlet.sourceType || "manual")}</small></span>
+          <span><b>${htmlEscape(outlet.connectivity?.outlet_last_seen ? new Date(outlet.connectivity.outlet_last_seen).toLocaleString() : "--")}</b><small>Last seen</small></span>
+        </div>
+        <label>Tenant
+          <select data-customer-for="${htmlEscape(switchEntityId)}" ${isOn ? "disabled" : ""}>
+            <option value="">Visitor / no tenant</option>
+            ${customers.map((customer) => `<option value="${htmlEscape(customer.id)}" ${customer.id === assignedCustomer?.id ? "selected" : ""}>${htmlEscape(customer.display_name)}</option>`).join("")}
+          </select>
+        </label>
         <label>Customer, bay, or booking reference
           <input data-reference-for="${htmlEscape(switchEntityId)}" value="${htmlEscape(activeReference)}" placeholder="Bay 14 - Smith">
         </label>
@@ -1203,7 +1575,7 @@ class PowReportingPanel extends HTMLElement {
             data-outlet-action="turn_on"
             data-switch-entity-id="${htmlEscape(switchEntityId)}"
             data-outlet-name="${htmlEscape(outlet.name)}"
-            ${busy || isOn ? "disabled" : ""}
+            ${busy || isOn || !canStart ? "disabled" : ""}
           >Power On</button>
           <button
             class="danger secondary"
@@ -1241,6 +1613,16 @@ class PowReportingPanel extends HTMLElement {
     const aggregate = this._aggregateMeterRows();
     const currency = this._billingReport.settings?.currency || "AUD";
     const managementSessions = this._managementReport?.sessions || [];
+    const gatewayOptions = this._gatewayRowsFromOutlets()
+      .map((gateway) => {
+        const label = gateway.gateway_name || gateway.gateway_id;
+        return `<option value="${htmlEscape(label)}" ${this._reportGatewayFilter === label ? "selected" : ""}>${htmlEscape(label)}</option>`;
+      })
+      .join("");
+    const zoneOptions = [...new Set(this._outlets.map((outlet) => outlet.gateway?.gateway_zone || outlet.mapping?.gateway_zone || outlet.mapping?.area || "").filter(Boolean))]
+      .sort()
+      .map((zone) => `<option value="${htmlEscape(zone)}" ${this._reportZoneFilter === zone ? "selected" : ""}>${htmlEscape(zone)}</option>`)
+      .join("");
     return `
       <section class="billing-card">
         <div class="section-head">
@@ -1252,6 +1634,7 @@ class PowReportingPanel extends HTMLElement {
         </div>
         ${this._managementMessage ? `<p class="notice">${htmlEscape(this._managementMessage)}</p>` : ""}
         ${this._managementKpis()}
+        ${this._loadManagementStatus()}
         <section class="report-controls management-filters">
           <label>Billing period<select id="billing-period-select">
             <option value="day" ${this._billingPeriod === "day" ? "selected" : ""}>Today</option>
@@ -1267,6 +1650,19 @@ class PowReportingPanel extends HTMLElement {
             <option value="">All statuses</option>
             ${(this._managementReport?.billing_states || []).map((state) => `<option value="${htmlEscape(state)}">${htmlEscape(state)}</option>`).join("")}
           </select></label>
+          <label>Gateway<select id="report-gateway-filter" data-management-filter>
+            <option value="">All gateways</option>
+            ${gatewayOptions}
+          </select></label>
+          <label>Zone<select id="report-zone-filter" data-management-filter>
+            <option value="">All zones</option>
+            ${zoneOptions}
+          </select></label>
+          <label>Connectivity<select id="report-connectivity-filter" data-management-filter>
+            <option value="">All connectivity</option>
+            ${(this._managementReport?.connectivity_states || ["online", "offline", "stale", "gateway_unreachable"]).map((state) => `<option value="${htmlEscape(state)}" ${this._reportConnectivityFilter === state ? "selected" : ""}>${htmlEscape(state.replaceAll("_", " "))}</option>`).join("")}
+          </select></label>
+          <label class="check"><input id="report-stale-offline-filter" data-management-filter type="checkbox" ${this._reportStaleOfflineFilter ? "checked" : ""}> Stale/offline only</label>
           <label>Reference<input id="report-reference-filter" data-management-filter placeholder="Customer, bay, ref"></label>
           <button id="download-management-csv" ${managementSessions.length ? "" : "disabled"}>Management CSV</button>
         </section>
@@ -1376,6 +1772,37 @@ class PowReportingPanel extends HTMLElement {
     `).join("")}</section>`;
   }
 
+  _loadManagementStatus() {
+    const load = this._managementReport?.load_management || {};
+    const evaluation = load.last_evaluation || {};
+    const groups = evaluation.groups || [];
+    const actions = evaluation.actions || [];
+    if (!groups.length && !actions.length) return "";
+    return `
+      <section class="load-management-card">
+        <div class="section-head">
+          <div>
+            <h2>Load Management</h2>
+            <p>${evaluation.time ? `Last evaluated ${htmlEscape(new Date(evaluation.time).toLocaleString())}` : "Waiting for live meter updates."}</p>
+          </div>
+        </div>
+        <div class="load-grid">
+          ${groups.map((group) => `
+            <div class="load-row ${group.over_limit || group.over_simultaneous_limit ? "load-warn" : ""}">
+              <strong>${htmlEscape(group.name || group.id || "Circuit group")}</strong>
+              <span>${htmlEscape(group.mode || "monitor_only")}</span>
+              <b>${formatNumber(group.power_w, 0)} W / ${group.effective_limit_w == null ? "--" : `${formatNumber(group.effective_limit_w, 0)} W`}</b>
+              <small>${formatNumber(group.active_outlets, 0)} active · ${formatNumber(group.paused_outlets, 0)} paused</small>
+            </div>
+          `).join("") || `<div class="empty">No circuit groups configured for load management.</div>`}
+        </div>
+        ${actions.length ? `<div class="load-actions">${actions.map((action) => `
+          <span>${htmlEscape(action.action)} ${htmlEscape(action.switch_entity_id)} · ${htmlEscape(action.reason)}</span>
+        `).join("")}</div>` : ""}
+      </section>
+    `;
+  }
+
   _statementCards(currency) {
     const statement = this._managementReport?.statement || {};
     const items = [
@@ -1423,17 +1850,27 @@ class PowReportingPanel extends HTMLElement {
         <div class="record-panel">
           <h2>Customers</h2>
           <form data-record-form="customer" class="record-form">
+            <input name="id" type="hidden">
             <input name="display_name" placeholder="Display name" required>
             <input name="contact_email" placeholder="Email">
             <input name="contact_telephone" placeholder="Telephone">
             <input name="apartment_unit_company" placeholder="Apartment, unit, or company">
             <input name="billing_reference" placeholder="Billing reference">
+            <div class="field-row">
+              <input name="billing_rate_per_kwh" type="number" min="0" step="0.0001" placeholder="Rate per kWh">
+              <input name="billing_currency" maxlength="3" value="AUD" placeholder="Currency">
+            </div>
+            <label>Assigned outlets / meters
+              <select name="outlet_entity_ids" multiple size="4">
+                ${this._outlets.map((outlet) => `<option value="${htmlEscape(outlet.entity.entity_id)}">${htmlEscape(outlet.name)}</option>`).join("")}
+              </select>
+            </label>
             <select name="user_group">
               <option value="">No group</option>
               ${groups.map((group) => `<option value="${htmlEscape(group.id)}">${htmlEscape(group.name)}</option>`).join("")}
             </select>
             <input name="notes" placeholder="Notes">
-            <button>Save Customer</button>
+            <button type="submit">Save Customer</button>
           </form>
           <div class="record-list">${customers.map((record) => this._customerRow(record, groups)).join("") || `<div class="empty">No customers found.</div>`}</div>
         </div>
@@ -1475,7 +1912,59 @@ class PowReportingPanel extends HTMLElement {
       record.billing_reference,
       group?.name,
       record.contact_email,
-    ]);
+      `${(record.outlet_entity_ids || []).length} meter${(record.outlet_entity_ids || []).length === 1 ? "" : "s"}`,
+      `${record.billing_currency || "AUD"} ${formatNumber(record.billing_rate_per_kwh || 0, 4)}/kWh`,
+    ], true);
+  }
+
+  _tenantBillingView() {
+    const customers = this._records?.customers || [];
+    const selected = customers.find((row) => row.id === this._billingCustomerId) || customers[0];
+    const statements = this._billingReport?.statements || [];
+    return `
+      ${this._billingMessage ? `<p class="notice">${htmlEscape(this._billingMessage)}</p>` : ""}
+      <section class="tenant-billing-controls">
+        <div class="tenant-billing-panel">
+          <h2>Create Tenant Statement</h2>
+          <label>Tenant<select id="statement-customer">
+            <option value="">Select tenant</option>
+            ${customers.map((customer) => `<option value="${htmlEscape(customer.id)}" ${customer.id === selected?.id ? "selected" : ""}>${htmlEscape(customer.display_name)} (${(customer.outlet_entity_ids || []).length} meters)</option>`).join("")}
+          </select></label>
+          <div class="field-row">
+            <label>From<input id="statement-start" type="date" value="${htmlEscape(this._billingStart)}"></label>
+            <label>Through<input id="statement-end" type="date" value="${htmlEscape(this._billingEnd)}"></label>
+          </div>
+          <label>Rate per kWh<input id="statement-rate" type="number" min="0" step="0.0001" value="${htmlEscape(selected?.billing_rate_per_kwh || "")}" placeholder="Uses tenant or default rate"></label>
+          <button id="create-tenant-statement" ${this._billingBusy || !customers.length ? "disabled" : ""}>Create Draft</button>
+        </div>
+        <div class="tenant-billing-panel">
+          <h2>Email Delivery</h2>
+          <p>Statements use each tenant's email address. Configure the Home Assistant email service in Settings.</p>
+          <p><strong>${htmlEscape(this._billingReport.settings?.notify_service || "No notify service configured")}</strong></p>
+          <p>Sending is always an explicit admin action and every attempt is retained.</p>
+        </div>
+      </section>
+      <section class="statement-list">
+        <div class="section-head"><h2>Tenant Statements</h2><span>${statements.length} saved</span></div>
+        ${statements.map((statement) => this._tenantStatementRow(statement)).join("") || `<div class="empty">No tenant statements have been created.</div>`}
+      </section>
+    `;
+  }
+
+  _tenantStatementRow(statement) {
+    const period = `${new Date(statement.period_start).toLocaleDateString()} - ${new Date(statement.period_end).toLocaleDateString()}`;
+    return `
+      <article class="tenant-statement-row">
+        <div>
+          <span class="status ${statement.status === "invoiced" ? "statement-sent" : ""}">${htmlEscape(statement.status)}</span>
+          <h3>${htmlEscape(statement.customer_name || statement.customer_id)}</h3>
+          <p>${htmlEscape(period)} · ${statement.meter_count} meters · ${statement.session_count} sessions</p>
+          <p>${formatNumber(statement.total_energy_kwh, 3)} kWh · <strong>${htmlEscape(formatCurrency(statement.total_amount, statement.currency))}</strong></p>
+          <details><summary>Email preview and meter breakdown</summary><pre>${htmlEscape(statement.email_body || "")}</pre></details>
+        </div>
+        <button data-send-statement="${htmlEscape(statement.statement_id)}" ${this._billingBusy || statement.status === "invoiced" || !statement.session_count ? "disabled" : ""}>Email Tenant</button>
+      </article>
+    `;
   }
 
   _vehicleRow(record, customers) {
@@ -1495,19 +1984,22 @@ class PowReportingPanel extends HTMLElement {
     ]);
   }
 
-  _recordRow(recordType, recordId, title, details) {
+  _recordRow(recordType, recordId, title, details, editableCustomer = false) {
     return `
       <div class="record-row">
         <span>
           <strong>${htmlEscape(title || recordId)}</strong>
           <small>${details.filter(Boolean).map(htmlEscape).join(" · ")}</small>
         </span>
-        <button
-          class="secondary"
-          data-archive-record
-          data-record-type="${htmlEscape(recordType)}"
-          data-record-id="${htmlEscape(recordId)}"
-        >Archive</button>
+        <div class="record-actions">
+          ${editableCustomer ? `<button class="secondary" data-edit-customer="${htmlEscape(recordId)}">Edit</button>` : ""}
+          <button
+            class="secondary"
+            data-archive-record
+            data-record-type="${htmlEscape(recordType)}"
+            data-record-id="${htmlEscape(recordId)}"
+          >Archive</button>
+        </div>
       </div>
     `;
   }
@@ -1614,10 +2106,30 @@ class PowReportingPanel extends HTMLElement {
             <input name="bay" placeholder="Bay / car park spot">
             <input name="power_entity_id" placeholder="Power entity override">
             <input name="energy_entity_id" placeholder="Energy entity override">
+            <input name="availability_entity_id" placeholder="Outlet availability entity">
+            <input name="rssi_entity_id" placeholder="Outlet RSSI entity">
+            <select name="source_type">
+              <option value="esphome_native">ESPHome native</option>
+              <option value="mqtt">MQTT</option>
+              <option value="manual">Manual</option>
+            </select>
+            <input name="mqtt_topic_prefix" placeholder="MQTT topic prefix">
+            <input name="stale_after_minutes" type="number" min="1" step="1" placeholder="Stale after minutes">
+            <input name="gateway_id" placeholder="Gateway id">
+            <input name="gateway_name" placeholder="Gateway name">
+            <input name="gateway_zone" placeholder="Gateway zone">
+            <input name="gateway_ip" placeholder="Gateway IP">
+            <input name="gateway_ssid" placeholder="Gateway SSID">
+            <input name="gateway_subnet" placeholder="Gateway subnet">
+            <input name="gateway_uptime_entity_id" placeholder="Gateway uptime entity">
+            <input name="gateway_client_count_entity_id" placeholder="Gateway client count entity">
+            <input name="gateway_uplink_rssi_entity_id" placeholder="Gateway uplink RSSI entity">
+            <input name="gateway_free_heap_entity_id" placeholder="Gateway free heap entity">
+            <input name="gateway_online_entity_id" placeholder="Gateway online entity">
             <input name="ha_label_ids" placeholder="HA labels, comma separated">
             <button>Assign Outlet</button>
           </form>
-          <div class="record-list">${outlets.map((record) => this._hierarchyRow("outlet", record.id, record.switch_entity_id, [record.bay, this._nameById(circuits, record.circuit_group_id), record.power_entity_id, record.energy_entity_id])).join("") || `<div class="empty">No outlet assignments yet.</div>`}</div>
+          <div class="record-list">${outlets.map((record) => this._hierarchyRow("outlet", record.id, record.switch_entity_id, [record.bay, this._nameById(circuits, record.circuit_group_id), record.gateway_name || record.gateway_id, record.gateway_zone, record.source_type, record.power_entity_id, record.energy_entity_id])).join("") || `<div class="empty">No outlet assignments yet.</div>`}</div>
         </div>
       </section>
     `;
@@ -1679,6 +2191,8 @@ class PowReportingPanel extends HTMLElement {
         <h2>Billing Settings</h2>
         <label>Energy rate<input id="billing-rate" type="number" min="0" step="0.01" value="${htmlEscape(this._billingReport.settings?.energy_rate ?? 0.32)}"></label>
         <label>Currency<input id="billing-currency" value="${htmlEscape(this._billingReport.settings?.currency || "AUD")}"></label>
+        <label>Email notify service<input id="billing-notify-service" value="${htmlEscape(this._billingReport.settings?.notify_service || "")}" placeholder="notify.smtp"></label>
+        <label>Statement sender name<input id="billing-sender-name" value="${htmlEscape(this._billingReport.settings?.sender_name || "ParkPower")}"></label>
         <button id="save-billing-settings">Save Billing Settings</button>
       </section>
       <section class="rename-tool">
@@ -1752,6 +2266,14 @@ class PowReportingPanel extends HTMLElement {
       .management-kpis strong, .statement-grid strong { font-size: 20px; }
       .statement-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin: 12px 0; }
       .management-charts { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+      .load-management-card { background: #fff; border: 1px solid #dde3e7; border-radius: 8px; padding: 16px; margin-top: 12px; }
+      .load-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+      .load-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px 10px; align-items: center; border: 1px solid #edf0f2; border-radius: 8px; padding: 10px; }
+      .load-row strong, .load-row span, .load-row b, .load-row small { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .load-row span, .load-row small { color: #5d6972; }
+      .load-warn { border-color: #fed7aa; background: #fff7ed; }
+      .load-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+      .load-actions span { border-radius: 999px; background: #eef6f5; color: #0f766e; padding: 5px 9px; font-size: 12px; font-weight: 700; }
       .series-card { border: 1px solid #edf0f2; border-radius: 8px; padding: 12px; }
       .series-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; padding: 7px 0; border-top: 1px solid #edf0f2; }
       .series-row span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #5d6972; }
@@ -1761,11 +2283,15 @@ class PowReportingPanel extends HTMLElement {
       .record-panel { display: grid; gap: 12px; background: #fff; border: 1px solid #dde3e7; border-radius: 8px; padding: 16px; }
       .record-form { display: grid; gap: 8px; }
       .record-form select, .record-form input { min-width: 0; width: 100%; box-sizing: border-box; }
+      .record-form select[multiple] { min-height: 108px; }
+      .field-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+      .field-row input { min-width: 0; width: 100%; box-sizing: border-box; }
       .check { display: flex; align-items: center; gap: 8px; color: #172026; }
       .record-list { display: grid; gap: 8px; }
       .record-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center; border-top: 1px solid #edf0f2; padding-top: 9px; }
       .record-row span { min-width: 0; }
       .record-row strong, .record-row small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .record-actions { display: flex; gap: 6px; }
       .master-control { display: grid; grid-template-columns: minmax(0, 1fr) minmax(220px, 320px) auto; gap: 12px; align-items: end; padding: 16px; margin-bottom: 16px; }
       .master-control p { margin-top: 4px; }
       .outlet-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; margin-bottom: 18px; }
@@ -1775,10 +2301,15 @@ class PowReportingPanel extends HTMLElement {
       .outlet-top p { margin-top: 4px; font-size: 12px; overflow: hidden; text-overflow: ellipsis; }
       .status { border-radius: 999px; padding: 4px 9px; background: #edf0f2; color: #33404a; font-size: 12px; font-weight: 700; }
       .is-on .status { background: #dcfce7; color: #166534; }
+      .status.status-warn { background: #fef3c7; color: #92400e; }
       .meter-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
       .meter-row span { display: grid; gap: 4px; background: #f6f7f9; border-radius: 7px; padding: 10px; }
       .meter-row b { font-size: 18px; }
       .meter-row small { color: #5d6972; }
+      .connectivity-row { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+      .connectivity-row span { display: grid; gap: 3px; min-width: 0; background: #f8fafc; border: 1px solid #edf0f2; border-radius: 7px; padding: 8px; }
+      .connectivity-row b, .connectivity-row small { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .connectivity-row b { font-size: 13px; }
       .outlet-actions { display: flex; gap: 8px; }
       .outlet-actions button { flex: 1; }
       .portal-shell { background: radial-gradient(circle at 12% 8%, color-mix(in srgb, var(--accent), transparent 78%), transparent 32%), linear-gradient(135deg, #081312, #12201f 52%, #0d1418); color: #e8f7f5; }
@@ -1805,6 +2336,16 @@ class PowReportingPanel extends HTMLElement {
       .event-on { color: #166534; }
       .event-off { color: #991b1b; }
       .billing-card { padding: 16px; margin-top: 16px; }
+      .network-health { margin: 0 0 18px; }
+      .network-grid { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(280px, .8fr); gap: 12px; }
+      .network-table { overflow: hidden; border: 1px solid #edf0f2; border-radius: 8px; }
+      .network-row { display: grid; grid-template-columns: minmax(120px, 1fr) minmax(100px, .8fr) 90px minmax(130px, .9fr); gap: 10px; align-items: center; padding: 10px 12px; border-bottom: 1px solid #edf0f2; }
+      .network-row strong, .network-row span, .network-row b, .network-row small { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .network-row span, .network-row small { color: #5d6972; }
+      .diagnostic-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+      .diagnostic-bucket { display: grid; gap: 4px; border: 1px solid #edf0f2; border-radius: 8px; padding: 10px; }
+      .diagnostic-bucket span, .diagnostic-bucket small { color: #5d6972; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .diagnostic-bucket strong { font-size: 22px; }
       .billing-actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; }
       .billing-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 12px 0; }
       .billing-summary article { border-color: #edf0f2; box-shadow: none; }
@@ -1813,6 +2354,19 @@ class PowReportingPanel extends HTMLElement {
       .billing-row { display: grid; grid-template-columns: 170px minmax(150px, 1.1fr) 90px 100px 100px minmax(120px, 1fr); gap: 10px; align-items: center; padding: 10px 12px; border-bottom: 1px solid #edf0f2; }
       .billing-row span, .billing-row strong, .billing-row b, .billing-row small { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .billing-row span, .billing-row small { color: #5d6972; }
+      .tenant-billing-controls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-bottom: 18px; }
+      .tenant-billing-panel { display: grid; gap: 12px; align-content: start; background: #fff; border: 1px solid #dde3e7; border-radius: 8px; padding: 16px; }
+      .tenant-billing-panel input, .tenant-billing-panel select { min-width: 0; width: 100%; box-sizing: border-box; }
+      .statement-list { display: grid; gap: 10px; }
+      .tenant-statement-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 16px; align-items: start; }
+      .tenant-statement-row h3 { margin: 4px 0 6px; font-size: 17px; }
+      .tenant-statement-row p { margin-top: 4px; }
+      .tenant-statement-row strong { display: inline; font-size: inherit; line-height: inherit; }
+      .tenant-statement-row .status { display: inline-block; margin: 0; text-transform: capitalize; }
+      .tenant-statement-row .statement-sent { background: #dcfce7; color: #166534; }
+      .tenant-statement-row details { margin-top: 12px; }
+      .tenant-statement-row summary { cursor: pointer; color: var(--accent); }
+      .tenant-statement-row pre { max-height: 320px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: 12px; background: #f6f7f9; border-radius: 7px; font: 13px/1.5 ui-monospace, monospace; }
       .aggregate-row { display: grid; grid-template-columns: minmax(150px, 1fr) minmax(190px, 1fr) 120px 120px; gap: 10px; align-items: center; padding: 10px 12px; border-bottom: 1px solid #edf0f2; }
       .aggregate-row span, .aggregate-row strong, .aggregate-row b { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .aggregate-row span { color: #5d6972; }
@@ -1834,9 +2388,11 @@ class PowReportingPanel extends HTMLElement {
         header, .columns { grid-template-columns: 1fr; display: grid; }
         .portal-hero { grid-template-columns: 1fr; }
         nav { overflow-x: auto; }
-        .summary-grid, .billing-summary, .management-kpis, .statement-grid, .management-charts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-        .record-grid, .hierarchy-grid { grid-template-columns: 1fr; }
-        .master-control, .audit-row, .rename-row, .billing-row, .aggregate-row { grid-template-columns: 1fr; }
+        .summary-grid, .billing-summary, .management-kpis, .statement-grid, .management-charts, .load-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .record-grid, .hierarchy-grid, .tenant-billing-controls { grid-template-columns: 1fr; }
+        .field-row { grid-template-columns: 1fr; }
+        .master-control, .audit-row, .rename-row, .billing-row, .aggregate-row, .network-row, .network-grid, .connectivity-row { grid-template-columns: 1fr; }
+        .tenant-statement-row { grid-template-columns: 1fr; }
         .outlet-actions { display: grid; }
         select, input { min-width: 0; width: 100%; box-sizing: border-box; }
       }
