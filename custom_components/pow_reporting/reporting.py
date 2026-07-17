@@ -20,13 +20,21 @@ def build_management_report(
     completed = [dict(session) for session in billing_report.get("completed", []) if isinstance(session, dict)]
     active = [dict(session) for session in billing_report.get("active", []) if isinstance(session, dict)]
     managed_sessions = [dict(session) for session in session_data.get("sessions", []) if isinstance(session, dict)]
+    filtered_outlets = _filter_outlets(outlets, filters)
     filtered_completed = _filter_sessions(completed, filters)
+    if _has_outlet_operational_filter(filters):
+        outlet_ids = {outlet.get("id") for outlet in filtered_outlets}
+        filtered_completed = [
+            session
+            for session in filtered_completed
+            if session.get("switch_entity_id") in outlet_ids
+        ]
     currency = billing_report.get("settings", {}).get("currency", "AUD")
     today_start = _start_of_day()
     month_start = today_start.replace(day=1)
 
     kpis = _build_kpis(
-        outlets=outlets,
+        outlets=filtered_outlets,
         active=active,
         completed=completed,
         filtered_completed=filtered_completed,
@@ -34,7 +42,7 @@ def build_management_report(
         today_start=today_start,
         month_start=month_start,
     )
-    charts = _build_charts(filtered_completed, outlets)
+    charts = _build_charts(filtered_completed, filtered_outlets)
     statement = _monthly_statement(filtered_completed, currency)
     rows = [_report_row(session, records) for session in filtered_completed]
 
@@ -45,7 +53,12 @@ def build_management_report(
         "charts": charts,
         "statement": statement,
         "sessions": rows,
+        "outlets": filtered_outlets,
+        "load_management": session_data.get("load_management", {}),
+        "gateways": _gateway_summary(outlets),
+        "diagnostics": _diagnostics(outlets),
         "billing_states": ["draft", "approved", "invoiced", "paid", "waived", "disputed"],
+        "connectivity_states": ["online", "offline", "stale", "gateway_unreachable"],
     }
 
 
@@ -73,6 +86,41 @@ def _filter_sessions(sessions: list[dict[str, Any]], filters: dict[str, Any]) ->
     return rows
 
 
+def _filter_outlets(outlets: list[dict[str, Any]], filters: dict[str, Any]) -> list[dict[str, Any]]:
+    """Apply operational filters to current outlet rows."""
+    gateway = str(filters.get("gateway") or "").strip().lower()
+    zone = str(filters.get("zone") or "").strip().lower()
+    connectivity = str(filters.get("connectivity") or "").strip().lower()
+    stale_offline = bool(filters.get("stale_offline"))
+    rows = []
+    for outlet in outlets:
+        outlet_gateway = outlet.get("gateway") or {}
+        gateway_text = " ".join(
+            str(value or "")
+            for value in [
+                outlet_gateway.get("gateway_id"),
+                outlet_gateway.get("gateway_name"),
+            ]
+        ).lower()
+        zone_text = str(outlet_gateway.get("gateway_zone") or outlet.get("area") or outlet.get("level") or "").lower()
+        state = str(outlet.get("connectivity_state") or "").lower()
+        if gateway and gateway not in gateway_text:
+            continue
+        if zone and zone not in zone_text:
+            continue
+        if connectivity and state != connectivity:
+            continue
+        if stale_offline and state not in {"offline", "stale", "gateway_unreachable"}:
+            continue
+        rows.append(dict(outlet))
+    return rows
+
+
+def _has_outlet_operational_filter(filters: dict[str, Any]) -> bool:
+    """Return true when filters depend on current outlet metadata."""
+    return any(filters.get(key) for key in ("gateway", "zone", "connectivity", "stale_offline"))
+
+
 def _build_kpis(
     *,
     outlets: list[dict[str, Any]],
@@ -86,6 +134,7 @@ def _build_kpis(
     """Calculate management KPIs."""
     outlet_count = len(outlets)
     outlet_states = Counter(str(outlet.get("state") or "unknown") for outlet in outlets)
+    connectivity_states = Counter(str(outlet.get("connectivity_state") or "unknown") for outlet in outlets)
     active_ids = {session.get("switch_entity_id") for session in active}
     waiting_states = {"authorised", "waiting_for_load", "idle_grace_period"}
     waiting = sum(1 for session in managed_sessions if session.get("state") in waiting_states)
@@ -96,7 +145,7 @@ def _build_kpis(
     energy_total = sum(_number(session.get("energy_kwh")) for session in filtered_completed)
     cost_total = sum(_number(session.get("cost")) for session in filtered_completed)
     duration_total = sum(_number(session.get("duration_seconds")) for session in filtered_completed)
-    live_power = sum(_number(outlet.get("power_w")) for outlet in outlets)
+    live_power = sum(_number(outlet.get("power_w")) for outlet in outlets if outlet.get("connectivity_state") == "online")
     average_sessions = max(len(filtered_completed), 1)
 
     return {
@@ -105,7 +154,14 @@ def _build_kpis(
         "active_charging_outlets": len(active_ids),
         "waiting_outlets": waiting,
         "load_managed_paused_outlets": paused,
-        "offline_outlets": outlet_states.get("unavailable", 0) + outlet_states.get("unknown", 0),
+        "offline_outlets": (
+            outlet_states.get("unavailable", 0)
+            + outlet_states.get("unknown", 0)
+            + connectivity_states.get("offline", 0)
+            + connectivity_states.get("gateway_unreachable", 0)
+        ),
+        "stale_outlets": connectivity_states.get("stale", 0),
+        "gateway_unreachable_outlets": connectivity_states.get("gateway_unreachable", 0),
         "faulted_outlets": faulted,
         "sessions_today": len(today_sessions),
         "energy_today": round(sum(_number(session.get("energy_kwh")) for session in today_sessions), 4),
@@ -158,6 +214,87 @@ def _build_charts(sessions: list[dict[str, Any]], outlets: list[dict[str, Any]])
             for outlet in outlets
             if _number(outlet.get("power_w")) > 0
         ],
+}
+
+
+def _gateway_summary(outlets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return one current row per configured gateway."""
+    gateways: dict[str, dict[str, Any]] = {}
+    for outlet in outlets:
+        gateway = outlet.get("gateway") or {}
+        gateway_id = str(gateway.get("gateway_id") or gateway.get("gateway_name") or "")
+        if not gateway_id:
+            continue
+        row = gateways.setdefault(
+            gateway_id,
+            {
+                **gateway,
+                "outlet_count": 0,
+                "offline_outlets": 0,
+                "stale_outlets": 0,
+                "mqtt_outlets": 0,
+            },
+        )
+        row["outlet_count"] += 1
+        if outlet.get("connectivity_state") in {"offline", "gateway_unreachable"}:
+            row["offline_outlets"] += 1
+        if outlet.get("connectivity_state") == "stale":
+            row["stale_outlets"] += 1
+        if outlet.get("source_type") == "mqtt":
+            row["mqtt_outlets"] += 1
+    return sorted(gateways.values(), key=lambda row: str(row.get("gateway_name") or row.get("gateway_id") or ""))
+
+
+def _diagnostics(outlets: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    """Return admin diagnostics for network-aware deployments."""
+    gateways = _gateway_summary(outlets)
+    return {
+        "outlets_with_no_gateway_mapping": [
+            _outlet_diag(outlet)
+            for outlet in outlets
+            if not (outlet.get("gateway") or {}).get("gateway_id") and not (outlet.get("gateway") or {}).get("gateway_name")
+        ],
+        "gateways_with_too_many_clients": [
+            gateway
+            for gateway in gateways
+            if _number(gateway.get("gateway_client_count")) > 12
+        ],
+        "weak_rssi_outlets": [
+            _outlet_diag(outlet)
+            for outlet in outlets
+            if outlet.get("outlet_rssi") is not None and _number(outlet.get("outlet_rssi")) < -75
+        ],
+        "offline_stale_outlets": [
+            _outlet_diag(outlet)
+            for outlet in outlets
+            if outlet.get("connectivity_state") in {"offline", "stale", "gateway_unreachable"}
+        ],
+        "gateways_with_weak_uplink_rssi": [
+            gateway
+            for gateway in gateways
+            if gateway.get("gateway_uplink_rssi") is not None and _number(gateway.get("gateway_uplink_rssi")) < -70
+        ],
+        "sonoffs_connected_through_nat_mqtt": [
+            _outlet_diag(outlet)
+            for outlet in outlets
+            if outlet.get("source_type") == "mqtt" or outlet.get("mqtt_topic_prefix")
+        ],
+    }
+
+
+def _outlet_diag(outlet: dict[str, Any]) -> dict[str, Any]:
+    """Return compact diagnostic outlet data."""
+    gateway = outlet.get("gateway") or {}
+    return {
+        "id": outlet.get("id"),
+        "name": outlet.get("name"),
+        "area": outlet.get("area"),
+        "level": outlet.get("level"),
+        "bay": outlet.get("bay"),
+        "connectivity_state": outlet.get("connectivity_state"),
+        "outlet_rssi": outlet.get("outlet_rssi"),
+        "source_type": outlet.get("source_type"),
+        "gateway": gateway.get("gateway_name") or gateway.get("gateway_id") or "",
     }
 
 

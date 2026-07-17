@@ -166,7 +166,11 @@ async def _websocket_save_record(
 ) -> None:
     """Create or update a local admin record."""
     manager = await async_load_records_manager(hass)
-    record = manager.upsert(msg["record_type"], msg["fields"])
+    try:
+        record = manager.upsert(msg["record_type"], msg["fields"])
+    except ValueError as err:
+        connection.send_error(msg["id"], "invalid_record", str(err))
+        return
     await async_save_records_manager(hass, manager)
     connection.send_result(msg["id"], {"record": record})
 

@@ -17,13 +17,16 @@ The integration adds a sidebar panel with:
 - local customer, vehicle, and user-group records
 - local organisation, site, building, distribution board, circuit group, and
   outlet assignment records
-- formal charging-session state tracking for future tariff/load-management work
+- formal charging-session state tracking with load-limit pause/resume support
 - configurable energy rate and currency for billing reports
+- tenant accounts with multiple assigned outlets or power meters
+- consolidated tenant statements and email delivery through Home Assistant
 - live charge timers on managed outlets
 - current load, total energy, and per-device/entity summaries
 - daily, weekly, monthly, and custom-range reports
 - management KPIs, report filters, chart-ready summaries, and monthly statement
   totals
+- gateway/network health monitoring for Wi-Fi bridge and MQTT/NAT deployments
 - charting from Home Assistant recorder statistics when available
 - CSV export for energy statistics, outlet power events, and billing sessions
 - local dashboard branding controls for name, logo URL, and accent color
@@ -143,14 +146,32 @@ start/end readings, and billing totals.
 The dashboard **Records** tab stores lightweight local records for:
 
 - Customers: name, contact details, apartment/unit/company, billing reference,
-  user group, status, and notes
+  assigned outlets/meters, per-kWh rate, currency, user group, status, and notes
 - Vehicles: linked customer, registration, make/model description, and notes
 - User groups: default tariff placeholder, priority, charging allowed, free
   charging, and discount percentage
 
-The existing free-text outlet reference remains available. Customer and vehicle
-selectors will be added to the outlet start workflow before tariff profiles are
-applied.
+The existing free-text outlet reference remains available. The outlet controls
+also provide a tenant selector and automatically select the customer assigned to
+that outlet. New billing and managed-session records keep that tenant ID.
+
+### Tenant Billing And Email
+
+The admin-only **Billing** tab creates one statement for a tenant across every
+completed session explicitly linked to that tenant, including sessions from
+multiple assigned meters. It provides a per-meter breakdown, total energy, total
+cost, an email preview, and delivery history.
+
+Statement pricing uses the tenant rate when configured, otherwise the global
+energy rate. User-group discounts and free-charging policy are applied. A
+successful email marks the statement and its included sessions as invoiced;
+failed attempts stay as drafts, and overlapping drafts cannot invoice the same
+session twice.
+
+Email is sent only after an administrator clicks **Email Tenant**. Configure an
+email-capable Home Assistant `notify` integration, then enter its service name in
+ParkPower Settings as either `notify.smtp` or `smtp`. Statements are sent as
+plain text to the email address on the tenant record.
 
 ### Site And Electrical Hierarchy
 
@@ -166,14 +187,34 @@ The dashboard **Hierarchy** tab stores Phase 5 commercial and electrical context
   and energy entities, including HA area/floor/label metadata where available
 
 These records are local to the integration under `.storage/pow_reporting.sessions`.
-They are intended to become the policy source for load management and more
-detailed area/level reporting in the next phases.
+They are the policy source for live load management and detailed area/level
+reporting.
+
+### Load Management
+
+Phase 6 uses the configured circuit group limits to protect electrical capacity:
+
+- live power readings are summed for each configured circuit group
+- effective limits subtract reserve margin from maximum power
+- `monitor_only` groups report overloads without changing relays
+- active modes can pause lower-priority charging sessions when power or
+  simultaneous-outlet limits are exceeded
+- paused sessions remain active in ParkPower as `paused_load_limit` rather than
+  being completed for billing
+- outlets are resumed when capacity returns and relay guardrails allow it
+- minimum relay on/off duration and maximum relay operations per hour are
+  enforced before any automatic action
+
+The **Reports** tab shows the latest load-management evaluation for each circuit
+group, including live watts, effective limit, active/paused outlet counts, and
+the last recommended actions.
 
 ### Session State Tracking
 
 Alongside the existing billing session list, ParkPower now keeps a richer
 managed-session ledger with states such as `waiting_for_load`, `charging`,
-`idle_grace_period`, `completed`, `cancelled`, and `requires_review`.
+`idle_grace_period`, `paused_load_limit`, `completed`, `cancelled`, and
+`requires_review`.
 
 Configurable thresholds control delayed charging start/stop detection:
 
@@ -218,6 +259,81 @@ The HACS portal reads Home Assistant registries for outlet metadata:
 Assign the ESPHome/Sonoff device to an Area in Home Assistant, put that Area on
 a Floor, and add a Bay/Spot label to the device or switch entity. The HACS panel
 will pick those changes up on the next refresh.
+
+### Large Car Park Wi-Fi Bridge Deployment
+
+Larger car parks can place Sonoff POW Elite outlets behind ESP32 Wi-Fi NAT bridge
+nodes when the main Wi-Fi network does not reach every bay cleanly. In that
+topology, ParkPower still discovers normal ESPHome/Home Assistant entities, and
+outlets can also be manually mapped with gateway metadata in the **Hierarchy**
+tab.
+
+Recommended topology:
+
+- Home Assistant and MQTT broker on the main building network.
+- One ESP32 bridge per local parking zone, mounted where it has a solid uplink
+  to the main Wi-Fi and clear coverage to nearby Sonoff outlets.
+- Sonoff POW Elite devices join the bridge SSID and publish relay, power,
+  energy, RSSI, and availability through MQTT.
+- Gateway health entities are exposed in Home Assistant as:
+  `sensor.<gateway>_uptime`, `sensor.<gateway>_client_count`,
+  `sensor.<gateway>_uplink_rssi`, `sensor.<gateway>_free_heap`, and
+  `binary_sensor.<gateway>_online`.
+
+ESP32 NAT bridge notes:
+
+- Treat each bridge as a small zone gateway, not as invisible infrastructure.
+  Give it a stable ID, name, zone, IP, SSID, and subnet, then map those fields on
+  each associated outlet.
+- Watch `client_count`, `uplink_rssi`, and `free_heap`. Too many clients or weak
+  uplink RSSI will show in ParkPower diagnostics before users report unreliable
+  charging.
+- Avoid chaining repeaters. Every repeated hop increases latency, airtime use,
+  packet loss, and recovery time after a power or Wi-Fi event.
+
+MQTT is recommended for Sonoffs behind NAT bridges. ESPHome native API uses
+direct TCP connections and discovery assumptions that may not work cleanly across
+NAT, especially when Home Assistant cannot route back to the private bridge
+subnet or when mDNS/device adoption traffic is blocked. MQTT gives each outlet a
+broker-facing path for telemetry, availability, and commands even when the
+device sits behind a translated subnet.
+
+Suggested Sonoff ESPHome MQTT shape:
+
+```yaml
+mqtt:
+  broker: 192.168.1.10
+  username: !secret mqtt_user
+  password: !secret mqtt_password
+  topic_prefix: parkpower/l1/bay01
+  birth_message:
+    topic: parkpower/l1/bay01/status
+    payload: online
+  will_message:
+    topic: parkpower/l1/bay01/status
+    payload: offline
+
+wifi:
+  ssid: ParkPower-L1-East
+  password: !secret bridge_wifi_password
+
+sensor:
+  - platform: wifi_signal
+    name: L1 Bay 01 RSSI
+    update_interval: 60s
+
+binary_sensor:
+  - platform: status
+    name: L1 Bay 01 Online
+```
+
+In ParkPower, set the outlet `source_type` to `mqtt`, add the
+`mqtt_topic_prefix`, set `stale_after_minutes`, and map any availability/RSSI
+entities. If the outlet is offline, the gateway is offline, or power/energy
+telemetry is stale, ParkPower marks the outlet as offline, stale, or
+`gateway_unreachable`. It will still allow recovery actions such as Power Off,
+but it will not start a new billing session or calculate live cost from stale
+sensor readings.
 
 ## ESP Display Panel
 

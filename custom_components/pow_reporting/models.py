@@ -236,6 +236,9 @@ class CustomerRecord:
     contact_telephone: str = ""
     apartment_unit_company: str = ""
     billing_reference: str = ""
+    outlet_entity_ids: list[str] = field(default_factory=list)
+    billing_rate_per_kwh: float = 0.0
+    billing_currency: str = "AUD"
     user_group: str = ""
     status: RecordStatus = RecordStatus.ACTIVE
     notes: str = ""
@@ -251,6 +254,9 @@ class CustomerRecord:
             "contact_telephone": self.contact_telephone,
             "apartment_unit_company": self.apartment_unit_company,
             "billing_reference": self.billing_reference,
+            "outlet_entity_ids": self.outlet_entity_ids,
+            "billing_rate_per_kwh": self.billing_rate_per_kwh,
+            "billing_currency": self.billing_currency,
             "user_group": self.user_group,
             "status": self.status.value,
             "notes": self.notes,
@@ -268,6 +274,13 @@ class CustomerRecord:
             contact_telephone=str(data.get("contact_telephone") or ""),
             apartment_unit_company=str(data.get("apartment_unit_company") or ""),
             billing_reference=str(data.get("billing_reference") or ""),
+            outlet_entity_ids=[
+                str(entity_id)
+                for entity_id in data.get("outlet_entity_ids", [])
+                if entity_id
+            ],
+            billing_rate_per_kwh=float(data.get("billing_rate_per_kwh") or 0),
+            billing_currency=str(data.get("billing_currency") or "AUD").upper(),
             user_group=str(data.get("user_group") or ""),
             status=_enum_value(RecordStatus, data.get("status"), RecordStatus.ACTIVE),
             notes=str(data.get("notes") or ""),

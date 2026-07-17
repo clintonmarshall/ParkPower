@@ -80,6 +80,39 @@ class HierarchyManagerTest(TestCase):
         self.assertEqual(records["circuit_groups"][0]["maximum_simultaneous_outlets"], 4.0)
         self.assertEqual(outlet["ha_label_ids"], ["Bay 01", "EV"])
 
+    def test_outlet_gateway_connectivity_fields_are_stored(self) -> None:
+        """Outlet assignments can carry gateway and MQTT connectivity metadata."""
+        manager = self._manager()
+
+        outlet = manager.upsert(
+            "outlet",
+            {
+                "switch_entity_id": "switch.bay_01",
+                "gateway_id": "gw_l1_east",
+                "gateway_name": "L1 East Bridge",
+                "gateway_zone": "L1 East",
+                "gateway_ip": "192.168.40.2",
+                "gateway_ssid": "ParkPower-Bridge",
+                "gateway_subnet": "192.168.40.0/24",
+                "gateway_uplink_rssi": "-67",
+                "gateway_client_count": "8",
+                "gateway_online_entity_id": "binary_sensor.gw_l1_east_online",
+                "gateway_uplink_rssi_entity_id": "sensor.gw_l1_east_uplink_rssi",
+                "outlet_availability": "online",
+                "outlet_rssi": "-71",
+                "stale_after_minutes": "20",
+                "mqtt_topic_prefix": "parkpower/l1/bay01",
+                "source_type": "mqtt",
+            },
+        )
+
+        self.assertEqual(outlet["gateway_id"], "gw_l1_east")
+        self.assertEqual(outlet["gateway_client_count"], 8.0)
+        self.assertEqual(outlet["gateway_uplink_rssi"], -67.0)
+        self.assertEqual(outlet["outlet_rssi"], -71.0)
+        self.assertEqual(outlet["stale_after_minutes"], 20.0)
+        self.assertEqual(outlet["source_type"], "mqtt")
+
     def test_archive_hides_record_by_default(self) -> None:
         """Archived hierarchy records are retained but hidden."""
         manager = self._manager()

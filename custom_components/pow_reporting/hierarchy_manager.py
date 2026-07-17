@@ -29,6 +29,13 @@ ELECTRICAL_FIELDS = {
     "maximum_relay_operations_per_hour",
 }
 
+OUTLET_NUMBER_FIELDS = {
+    "gateway_uplink_rssi",
+    "gateway_client_count",
+    "outlet_rssi",
+    "stale_after_minutes",
+}
+
 ALLOWED_FIELDS = {
     "organisation": {
         "id",
@@ -92,6 +99,8 @@ ALLOWED_FIELDS = {
         "switch_entity_id",
         "power_entity_id",
         "energy_entity_id",
+        "availability_entity_id",
+        "rssi_entity_id",
         "site_id",
         "building_id",
         "distribution_board_id",
@@ -99,6 +108,27 @@ ALLOWED_FIELDS = {
         "level",
         "area",
         "bay",
+        "gateway_id",
+        "gateway_name",
+        "gateway_zone",
+        "gateway_ip",
+        "gateway_ssid",
+        "gateway_subnet",
+        "gateway_last_seen",
+        "gateway_uplink_rssi",
+        "gateway_client_count",
+        "gateway_status",
+        "gateway_uptime_entity_id",
+        "gateway_client_count_entity_id",
+        "gateway_uplink_rssi_entity_id",
+        "gateway_free_heap_entity_id",
+        "gateway_online_entity_id",
+        "outlet_last_seen",
+        "outlet_rssi",
+        "outlet_availability",
+        "stale_after_minutes",
+        "mqtt_topic_prefix",
+        "source_type",
         "ha_area_id",
         "ha_floor_id",
         "ha_label_ids",
@@ -206,6 +236,10 @@ def _clean_fields(record_type: str, fields: dict[str, Any]) -> dict[str, Any]:
     cleaned = {key: value for key, value in fields.items() if key in allowed}
     for key in ELECTRICAL_FIELDS.intersection(cleaned):
         cleaned[key] = _optional_number(cleaned[key])
+    for key in OUTLET_NUMBER_FIELDS.intersection(cleaned):
+        cleaned[key] = _optional_number(cleaned[key])
+    if "source_type" in cleaned and cleaned["source_type"] not in {"esphome_native", "mqtt", "manual"}:
+        cleaned["source_type"] = "manual"
     if "priority" in cleaned:
         cleaned["priority"] = int(_optional_number(cleaned["priority"]) or 0)
     if "enabled" in cleaned:

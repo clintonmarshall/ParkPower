@@ -102,6 +102,37 @@ class RecordsManagerTest(TestCase):
         self.assertEqual(len(records["customers"]), 1)
         self.assertEqual(records["customers"][0]["display_name"], "Alex")
 
+    def test_customer_can_own_multiple_outlets(self) -> None:
+        """One tenant can explicitly own several metered outlets."""
+        manager = self._manager()
+        customer = manager.upsert(
+            "customer",
+            {
+                "display_name": "Multi Meter Tenant",
+                "outlet_entity_ids": ["switch.bay_1", "switch.bay_2"],
+                "billing_rate_per_kwh": 0.32,
+                "billing_currency": "aud",
+            },
+        )
+
+        self.assertEqual(len(customer["outlet_entity_ids"]), 2)
+        self.assertEqual(customer["billing_currency"], "AUD")
+        self.assertEqual(manager.customer_for_outlet("switch.bay_2").id, customer["id"])
+
+    def test_outlet_cannot_be_assigned_to_two_active_customers(self) -> None:
+        """Ambiguous meter ownership is rejected before billing."""
+        manager = self._manager()
+        manager.upsert(
+            "customer",
+            {"display_name": "First", "outlet_entity_ids": ["switch.bay_1"]},
+        )
+
+        with self.assertRaisesRegex(ValueError, "already assigned"):
+            manager.upsert(
+                "customer",
+                {"display_name": "Second", "outlet_entity_ids": ["switch.bay_1"]},
+            )
+
 
 if __name__ == "__main__":
     import unittest
