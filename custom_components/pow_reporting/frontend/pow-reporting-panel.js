@@ -1,4 +1,5 @@
 const STORAGE_KEY = "pow-reporting-settings";
+const DEFAULT_LOGO_URL = "/api/parkpower-public/logo.png";
 
 const POWER_UNITS = new Set(["W", "kW"]);
 const ENERGY_UNITS = new Set(["Wh", "kWh"]);
@@ -114,7 +115,7 @@ class PowReportingPanel extends HTMLElement {
     this._renderTimer = undefined;
     this._settings = {
       name: "Adaptive Services ParkPower",
-      logoUrl: "",
+      logoUrl: DEFAULT_LOGO_URL,
       accent: "#0f766e",
       filter: "sonoff,pow,esphome",
     };
@@ -191,6 +192,7 @@ class PowReportingPanel extends HTMLElement {
     try {
       const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
       this._settings = { ...this._settings, ...saved };
+      this._settings.logoUrl = this._settings.logoUrl || DEFAULT_LOGO_URL;
     } catch (_err) {
       localStorage.removeItem(STORAGE_KEY);
     }
@@ -1302,7 +1304,7 @@ class PowReportingPanel extends HTMLElement {
     this.shadowRoot.querySelector("#save-settings")?.addEventListener("click", () => {
       this._settings = {
         name: this.shadowRoot.querySelector("#setting-name").value.trim() || "Adaptive Services ParkPower",
-        logoUrl: this.shadowRoot.querySelector("#setting-logo").value.trim(),
+        logoUrl: this.shadowRoot.querySelector("#setting-logo").value.trim() || DEFAULT_LOGO_URL,
         accent: this.shadowRoot.querySelector("#setting-accent").value || "#0f766e",
         filter: this.shadowRoot.querySelector("#setting-filter").value.trim(),
       };
@@ -2182,7 +2184,7 @@ class PowReportingPanel extends HTMLElement {
     return `
       <section class="settings">
         <label>Dashboard name<input id="setting-name" value="${htmlEscape(this._settings.name)}"></label>
-        <label>Logo URL<input id="setting-logo" value="${htmlEscape(this._settings.logoUrl)}" placeholder="/local/company-logo.png"></label>
+        <label>Logo URL<input id="setting-logo" value="${htmlEscape(this._settings.logoUrl)}" placeholder="${DEFAULT_LOGO_URL}"></label>
         <label>Accent color<input id="setting-accent" type="color" value="${htmlEscape(this._settings.accent)}"></label>
         <label>Entity filter keywords<input id="setting-filter" value="${htmlEscape(this._settings.filter)}" placeholder="sonoff,pow,esphome"></label>
         <button id="save-settings">Save</button>

@@ -42,6 +42,7 @@ from .const import (
     DEFAULT_SESSION_THRESHOLDS,
     DEFAULT_DASHBOARD_NAME,
     DEFAULT_ENTITY_FILTER,
+    DEFAULT_LOGO_URL,
     DEFAULT_PORTAL_NAME,
     DEFAULT_PORTAL_URL_PATH,
     DEFAULT_PUBLIC_PORT,
@@ -175,6 +176,7 @@ async def _async_register_public_http(
     data["public_options"] = options
     if not data.get("public_http_registered"):
         hass.http.register_view(ParkPowerPublicPortalView())
+        hass.http.register_view(ParkPowerPublicLogoView())
         hass.http.register_view(ParkPowerPublicSettingsView())
         hass.http.register_view(ParkPowerPublicSummaryView())
         hass.http.register_view(ParkPowerPublicOutletsView())
@@ -204,6 +206,7 @@ async def _async_start_public_portal_server(
     app["hass"] = hass
     app.router.add_get("/", _public_portal_http_handler)
     app.router.add_get("/parkpower-public", _public_portal_http_handler)
+    app.router.add_get("/api/parkpower-public/logo.png", _public_logo_http_handler)
     app.router.add_get("/api/parkpower-public/settings", _public_settings_http_handler)
     app.router.add_get("/api/parkpower-public/summary", _public_summary_http_handler)
     app.router.add_get("/api/parkpower-public/outlets", _public_outlets_http_handler)
@@ -239,7 +242,7 @@ async def _async_register_dashboard(
     sidebar_title = options.get(CONF_DASHBOARD_NAME, DEFAULT_DASHBOARD_NAME)
     sidebar_icon = options.get(CONF_SIDEBAR_ICON, DEFAULT_SIDEBAR_ICON)
     entity_filter = options.get(CONF_ENTITY_FILTER, DEFAULT_ENTITY_FILTER)
-    logo_url = options.get(CONF_LOGO_URL, "")
+    logo_url = options.get(CONF_LOGO_URL) or DEFAULT_LOGO_URL
 
     panel_path = Path(__file__).parent / "frontend" / "pow-reporting-panel.js"
     await _async_register_static_path_once(hass, panel_path)
@@ -1097,6 +1100,11 @@ async def _public_portal_http_handler(request: web.Request) -> web.Response:
     return web.FileResponse(Path(__file__).parent / "frontend" / "public-portal.html")
 
 
+async def _public_logo_http_handler(request: web.Request) -> web.Response:
+    """Return the packaged ParkPower logo."""
+    return web.FileResponse(Path(__file__).parent / "frontend" / "sm-logo.png")
+
+
 async def _public_settings_http_handler(request: web.Request) -> web.Response:
     """Return public portal settings."""
     hass = request.app["hass"]
@@ -1104,7 +1112,7 @@ async def _public_settings_http_handler(request: web.Request) -> web.Response:
     return web.json_response(
         {
             "name": options.get(CONF_PORTAL_NAME) or options.get(CONF_DASHBOARD_NAME, DEFAULT_DASHBOARD_NAME),
-            "logo_url": options.get(CONF_LOGO_URL, ""),
+            "logo_url": options.get(CONF_LOGO_URL) or DEFAULT_LOGO_URL,
             "accent": "#0f766e",
         }
     )
@@ -1243,6 +1251,18 @@ class ParkPowerPublicPortalView(HomeAssistantView):
     async def get(self, request: web.Request) -> web.Response:
         """Return the public portal HTML."""
         return await _public_portal_http_handler(request)
+
+
+class ParkPowerPublicLogoView(HomeAssistantView):
+    """Serve the packaged ParkPower logo without authentication."""
+
+    url = "/api/parkpower-public/logo.png"
+    name = "api:parkpower_public:logo"
+    requires_auth = False
+
+    async def get(self, request: web.Request) -> web.Response:
+        """Return the branded PNG asset."""
+        return await _public_logo_http_handler(request)
 
 
 class ParkPowerPublicSettingsView(HomeAssistantView):
