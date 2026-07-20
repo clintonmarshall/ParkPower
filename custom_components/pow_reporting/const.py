@@ -26,6 +26,7 @@ DEFAULT_URL_PATH = "parkpower"
 DEFAULT_PORTAL_URL_PATH = "parkpower-portal"
 DEFAULT_PUBLIC_PORT = 4177
 DEFAULT_ENTITY_FILTER = "sonoff,pow,esphome"
+DEFAULT_LOGO_URL = "/api/parkpower-public/logo.png"
 
 PANEL_JS_URL = f"/api/{DOMAIN}/static/pow-reporting-panel.js"
 

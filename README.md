@@ -50,6 +50,10 @@ integration from the UI.
 
 ## Branding
 
+ParkPower includes the SM logo as its default dashboard and customer-portal
+brand mark. The image is packaged with the HACS integration, so no `/config/www`
+copy is required.
+
 The first version stores branding in the browser using local storage. Open the
 dashboard, choose the settings tab, and set:
 
@@ -57,6 +61,9 @@ dashboard, choose the settings tab, and set:
 - logo URL
 - accent color
 - entity filter
+
+Entering another logo URL replaces the packaged logo. Clearing the field restores
+the built-in SM logo.
 
 For a commercial deployment, the next step should be moving those options into
 the integration options flow so they are managed centrally in Home Assistant.
