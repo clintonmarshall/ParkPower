@@ -2625,4 +2625,6 @@ class PowReportingPanel extends HTMLElement {
   }
 }
 
-customElements.define("pow-reporting-panel", PowReportingPanel);
+if (!customElements.get("pow-reporting-panel")) {
+  customElements.define("pow-reporting-panel", PowReportingPanel);
+}
