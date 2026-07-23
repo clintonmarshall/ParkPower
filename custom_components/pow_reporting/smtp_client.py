@@ -53,7 +53,7 @@ class SMTPSettings:
             raise ValueError("SMTP port must be between 1 and 65535")
         if security not in SMTP_SECURITY_MODES:
             raise ValueError("SMTP security must be STARTTLS, SSL/TLS, or None")
-        if not _is_email_address(sender_email):
+        if not is_email_address(sender_email):
             raise ValueError("A valid SMTP sender email address is required")
         if username and not password:
             raise ValueError("SMTP password is required when a username is configured")
@@ -78,7 +78,7 @@ def send_smtp_email(
 ) -> None:
     """Send one plain-text email through a validated SMTP account."""
     recipient = recipient.strip()
-    if not _is_email_address(recipient):
+    if not is_email_address(recipient):
         raise ValueError("A valid recipient email address is required")
 
     message = EmailMessage()
@@ -166,7 +166,7 @@ def _smtp_ready(settings: Mapping[str, Any]) -> bool:
     return True
 
 
-def _is_email_address(value: str) -> bool:
+def is_email_address(value: str) -> bool:
     """Perform a conservative single-address validation."""
     display_name, address = parseaddr(value)
     return (
