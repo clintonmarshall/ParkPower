@@ -706,21 +706,32 @@ class PowReportingPanel extends HTMLElement {
   }
 
   async _saveBillingSettings() {
-    if (!this._hass?.callWS) return;
+    if (!this._hass?.callWS) return false;
     const rate = Number(this.shadowRoot.querySelector("#billing-rate")?.value);
     const currency = this.shadowRoot.querySelector("#billing-currency")?.value.trim() || "AUD";
     const notifyService = this.shadowRoot.querySelector("#billing-notify-service")?.value.trim() || "";
     const senderName = this.shadowRoot.querySelector("#billing-sender-name")?.value.trim() || "ParkPower";
+    const deliveryMethod = this.shadowRoot.querySelector("#billing-delivery-method")?.value || "notify";
+    const smtpPassword = this.shadowRoot.querySelector("#billing-smtp-password")?.value || "";
+    const payload = {
+      type: "pow_reporting/save_billing_settings",
+      energy_rate: Number.isFinite(rate) ? rate : 0,
+      currency,
+      notify_service: notifyService,
+      sender_name: senderName,
+      email_delivery_method: deliveryMethod,
+      smtp_host: this.shadowRoot.querySelector("#billing-smtp-host")?.value.trim() || "",
+      smtp_port: Number(this.shadowRoot.querySelector("#billing-smtp-port")?.value || 587),
+      smtp_security: this.shadowRoot.querySelector("#billing-smtp-security")?.value || "starttls",
+      smtp_username: this.shadowRoot.querySelector("#billing-smtp-username")?.value.trim() || "",
+      smtp_sender_email: this.shadowRoot.querySelector("#billing-smtp-sender-email")?.value.trim() || "",
+      clear_smtp_password: this.shadowRoot.querySelector("#billing-smtp-clear-password")?.checked || false,
+    };
+    if (smtpPassword) payload.smtp_password = smtpPassword;
     this._billingMessage = "";
     this._requestRender({ force: true });
     try {
-      const data = await this._hass.callWS({
-        type: "pow_reporting/save_billing_settings",
-        energy_rate: Number.isFinite(rate) ? rate : 0,
-        currency,
-        notify_service: notifyService,
-        sender_name: senderName,
-      });
+      const data = await this._hass.callWS(payload);
       this._billingReport = {
         settings: { energy_rate: 0.32, currency: "AUD", ...(data?.settings || {}) },
         active: Array.isArray(data?.active) ? data.active : [],
@@ -730,9 +741,37 @@ class PowReportingPanel extends HTMLElement {
       };
       await this._loadManagementReport();
       this._billingMessage = "Billing settings saved.";
+      return true;
     } catch (err) {
       this._billingMessage = err?.message || "Unable to save billing settings.";
+      return false;
     } finally {
+      this._requestRender();
+    }
+  }
+
+  async _testSmtpSettings() {
+    const recipient = this.shadowRoot.querySelector("#billing-smtp-test-recipient")?.value.trim() || "";
+    if (!recipient) {
+      this._billingMessage = "Enter a test recipient email address.";
+      this._requestRender({ force: true });
+      return;
+    }
+    if (!await this._saveBillingSettings()) return;
+
+    this._billingBusy = true;
+    this._billingMessage = "Sending SMTP test email...";
+    this._requestRender({ force: true });
+    try {
+      await this._hass.callWS({
+        type: "pow_reporting/test_smtp_settings",
+        recipient,
+      });
+      this._billingMessage = `SMTP test email sent to ${recipient}.`;
+    } catch (err) {
+      this._billingMessage = err?.message || "Unable to send SMTP test email.";
+    } finally {
+      this._billingBusy = false;
       this._requestRender();
     }
   }
@@ -1246,6 +1285,7 @@ class PowReportingPanel extends HTMLElement {
       });
     });
     this.shadowRoot.querySelector("#save-billing-settings")?.addEventListener("click", () => this._saveBillingSettings());
+    this.shadowRoot.querySelector("#test-smtp-settings")?.addEventListener("click", () => this._testSmtpSettings());
     this.shadowRoot.querySelector("#create-tenant-statement")?.addEventListener("click", () => this._createTenantStatement());
     this.shadowRoot.querySelector("#statement-customer")?.addEventListener("change", (event) => {
       this._billingCustomerId = event.target.value;
@@ -1923,6 +1963,15 @@ class PowReportingPanel extends HTMLElement {
     const customers = this._records?.customers || [];
     const selected = customers.find((row) => row.id === this._billingCustomerId) || customers[0];
     const statements = this._billingReport?.statements || [];
+    const emailSettings = this._billingReport?.settings || {};
+    const deliveryMethod = emailSettings.email_delivery_method || "notify";
+    const deliveryStatus = deliveryMethod === "smtp"
+      ? (emailSettings.smtp_ready
+        ? `Direct SMTP ready · ${emailSettings.smtp_host}:${emailSettings.smtp_port}`
+        : "Direct SMTP needs configuration")
+      : (emailSettings.notify_service
+        ? `Home Assistant · notify.${emailSettings.notify_service.replace(/^notify\./, "")}`
+        : "No Home Assistant notify service configured");
     return `
       ${this._billingMessage ? `<p class="notice">${htmlEscape(this._billingMessage)}</p>` : ""}
       <section class="tenant-billing-controls">
@@ -1941,8 +1990,8 @@ class PowReportingPanel extends HTMLElement {
         </div>
         <div class="tenant-billing-panel">
           <h2>Email Delivery</h2>
-          <p>Statements use each tenant's email address. Configure the Home Assistant email service in Settings.</p>
-          <p><strong>${htmlEscape(this._billingReport.settings?.notify_service || "No notify service configured")}</strong></p>
+          <p>Statements use each tenant's saved email address and the delivery method configured in Settings.</p>
+          <p><strong>${htmlEscape(deliveryStatus)}</strong></p>
           <p>Sending is always an explicit admin action and every attempt is retained.</p>
         </div>
       </section>
@@ -2181,6 +2230,12 @@ class PowReportingPanel extends HTMLElement {
 
   _settingsView() {
     const changed = this._renamePreview.filter((item) => item.changed).length;
+    const billing = this._billingReport.settings || {};
+    const deliveryMethod = billing.email_delivery_method || "notify";
+    const smtpSecurity = billing.smtp_security || "starttls";
+    const passwordPlaceholder = billing.smtp_password_configured
+      ? "Saved · leave blank to keep"
+      : "SMTP password";
     return `
       <section class="settings">
         <label>Dashboard name<input id="setting-name" value="${htmlEscape(this._settings.name)}"></label>
@@ -2191,10 +2246,41 @@ class PowReportingPanel extends HTMLElement {
       </section>
       <section class="settings">
         <h2>Billing Settings</h2>
-        <label>Energy rate<input id="billing-rate" type="number" min="0" step="0.01" value="${htmlEscape(this._billingReport.settings?.energy_rate ?? 0.32)}"></label>
-        <label>Currency<input id="billing-currency" value="${htmlEscape(this._billingReport.settings?.currency || "AUD")}"></label>
-        <label>Email notify service<input id="billing-notify-service" value="${htmlEscape(this._billingReport.settings?.notify_service || "")}" placeholder="notify.smtp"></label>
-        <label>Statement sender name<input id="billing-sender-name" value="${htmlEscape(this._billingReport.settings?.sender_name || "ParkPower")}"></label>
+        <div class="field-row">
+          <label>Energy rate<input id="billing-rate" type="number" min="0" step="0.01" value="${htmlEscape(billing.energy_rate ?? 0.32)}"></label>
+          <label>Currency<input id="billing-currency" value="${htmlEscape(billing.currency || "AUD")}"></label>
+        </div>
+        <label>Email delivery method<select id="billing-delivery-method">
+          <option value="smtp" ${deliveryMethod === "smtp" ? "selected" : ""}>Direct SMTP</option>
+          <option value="notify" ${deliveryMethod === "notify" ? "selected" : ""}>Home Assistant notify service</option>
+        </select></label>
+        <label>Statement sender name<input id="billing-sender-name" value="${htmlEscape(billing.sender_name || "ParkPower")}"></label>
+        <h3>Direct SMTP</h3>
+        <div class="field-row">
+          <label>SMTP server<input id="billing-smtp-host" value="${htmlEscape(billing.smtp_host || "")}" placeholder="smtp.example.com" autocomplete="off"></label>
+          <label>SMTP port<input id="billing-smtp-port" type="number" min="1" max="65535" value="${htmlEscape(billing.smtp_port || 587)}"></label>
+        </div>
+        <label>Connection security<select id="billing-smtp-security">
+          <option value="starttls" ${smtpSecurity === "starttls" ? "selected" : ""}>STARTTLS</option>
+          <option value="ssl" ${smtpSecurity === "ssl" ? "selected" : ""}>SSL/TLS</option>
+          <option value="none" ${smtpSecurity === "none" ? "selected" : ""}>None</option>
+        </select></label>
+        <div class="field-row">
+          <label>SMTP username<input id="billing-smtp-username" value="${htmlEscape(billing.smtp_username || "")}" autocomplete="username"></label>
+          <label>SMTP password<input id="billing-smtp-password" type="password" placeholder="${passwordPlaceholder}" autocomplete="new-password"></label>
+        </div>
+        <label>Sender email address<input id="billing-smtp-sender-email" type="email" value="${htmlEscape(billing.smtp_sender_email || "")}" placeholder="billing@example.com"></label>
+        ${billing.smtp_password_configured ? `
+          <label class="check"><input id="billing-smtp-clear-password" type="checkbox">Remove saved SMTP password</label>
+        ` : ""}
+        <div class="field-row">
+          <label>Test recipient<input id="billing-smtp-test-recipient" type="email" placeholder="admin@example.com"></label>
+          <div class="settings-actions">
+            <button id="test-smtp-settings" class="secondary" ${this._billingBusy ? "disabled" : ""}>Send Test</button>
+          </div>
+        </div>
+        <h3>Home Assistant Notify</h3>
+        <label>Email notify service<input id="billing-notify-service" value="${htmlEscape(billing.notify_service || "")}" placeholder="notify.smtp"></label>
         <button id="save-billing-settings">Save Billing Settings</button>
       </section>
       <section class="rename-tool">
@@ -2374,8 +2460,12 @@ class PowReportingPanel extends HTMLElement {
       .aggregate-row span { color: #5d6972; }
       .chart { display: block; width: 100%; height: 300px; background: linear-gradient(#edf1f3 1px, transparent 1px), linear-gradient(90deg, #edf1f3 1px, transparent 1px); background-size: 100% 25%, 12.5% 100%; border-radius: 8px; }
       .chart-meta { display: flex; justify-content: space-between; gap: 10px; margin-top: 12px; color: #5d6972; }
-      .settings { display: grid; gap: 14px; max-width: 560px; padding: 16px; margin-bottom: 16px; }
+      .settings { display: grid; gap: 14px; max-width: 720px; padding: 16px; margin-bottom: 16px; }
       .settings label { color: #172026; }
+      .settings select, .settings input { min-width: 0; width: 100%; box-sizing: border-box; }
+      .settings .check input { width: auto; }
+      .settings-actions { display: flex; align-items: end; }
+      .settings-actions button { width: 100%; }
       .rename-tool { padding: 16px; }
       .rename-tool p { margin-top: 4px; }
       .rename-actions { display: flex; gap: 8px; align-items: center; }

@@ -20,7 +20,7 @@ The integration adds a sidebar panel with:
 - formal charging-session state tracking with load-limit pause/resume support
 - configurable energy rate and currency for billing reports
 - tenant accounts with multiple assigned outlets or power meters
-- consolidated tenant statements and email delivery through Home Assistant
+- consolidated tenant statements with direct SMTP or Home Assistant notify delivery
 - live charge timers on managed outlets
 - current load, total energy, and per-device/entity summaries
 - daily, weekly, monthly, and custom-range reports
@@ -175,10 +175,23 @@ successful email marks the statement and its included sessions as invoiced;
 failed attempts stay as drafts, and overlapping drafts cannot invoice the same
 session twice.
 
-Email is sent only after an administrator clicks **Email Tenant**. Configure an
-email-capable Home Assistant `notify` integration, then enter its service name in
-ParkPower Settings as either `notify.smtp` or `smtp`. Statements are sent as
-plain text to the email address on the tenant record.
+Email is sent only after an administrator clicks **Email Tenant**. In the
+ParkPower **Settings** tab, choose one of these delivery methods:
+
+- **Direct SMTP**: enter the SMTP server, port, security mode, username,
+  password, sender name, and sender email address. STARTTLS, implicit SSL/TLS,
+  and unencrypted local relays are supported.
+- **Home Assistant notify service**: enter an existing email-capable service as
+  either `notify.smtp` or `smtp`.
+
+Typical SMTP ports are `587` for STARTTLS, `465` for SSL/TLS, and `25` for a
+local relay. Use **Send Test** to verify the saved direct SMTP account before
+emailing tenant statements.
+
+SMTP credentials remain in Home Assistant's server-side ParkPower storage. The
+password is never returned to the dashboard, public portal, reports, delivery
+history, or logs. A blank password field preserves the saved password; the
+explicit removal checkbox deletes it.
 
 ### Site And Electrical Hierarchy
 
