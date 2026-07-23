@@ -28,7 +28,8 @@ DEFAULT_PUBLIC_PORT = 4177
 DEFAULT_ENTITY_FILTER = "sonoff,pow,esphome"
 DEFAULT_LOGO_URL = "/api/parkpower-public/logo.png"
 
-PANEL_JS_URL = f"/api/{DOMAIN}/static/pow-reporting-panel.js"
+PANEL_JS_PATH = f"/api/{DOMAIN}/static/pow-reporting-panel.js"
+PANEL_JS_URL = f"{PANEL_JS_PATH}?v=0.9.1"
 
 DEFAULT_SESSION_THRESHOLDS = {
     CONF_CHARGING_START_WATTS: 50.0,
