@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from functools import partial
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -53,6 +54,12 @@ from .const import (
 )
 from .coordinator import PowReportingCoordinator
 from .reporting import build_management_report, default_filter_period
+from .smtp_client import (
+    SMTPSettings,
+    safe_smtp_settings,
+    send_smtp_email,
+    smtp_error_message,
+)
 from .tenant_billing import TenantBillingManager
 from .websocket import (
     async_load_hierarchy_manager,
@@ -292,6 +299,7 @@ def _async_register_websocket_commands(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, _websocket_get_billing_report)
     websocket_api.async_register_command(hass, _websocket_get_management_report)
     websocket_api.async_register_command(hass, _websocket_save_billing_settings)
+    websocket_api.async_register_command(hass, _websocket_test_smtp_settings)
     websocket_api.async_register_command(hass, _websocket_create_tenant_statement)
     websocket_api.async_register_command(hass, _websocket_send_tenant_statement)
     websocket_api.async_register_command(hass, _websocket_control_outlet)
@@ -388,6 +396,13 @@ async def _async_load_billing(hass: HomeAssistant) -> dict[str, Any]:
     settings.setdefault("currency", "AUD")
     settings.setdefault("notify_service", "")
     settings.setdefault("sender_name", "ParkPower")
+    settings.setdefault("email_delivery_method", "notify")
+    settings.setdefault("smtp_host", "")
+    settings.setdefault("smtp_port", 587)
+    settings.setdefault("smtp_security", "starttls")
+    settings.setdefault("smtp_username", "")
+    settings.setdefault("smtp_password", "")
+    settings.setdefault("smtp_sender_email", "")
     active = data.get("active")
     if not isinstance(active, dict):
         active = {}
@@ -581,7 +596,12 @@ async def _async_record_session_event(
     await async_save_session_manager(hass, manager)
 
 
-def _billing_report(hass: HomeAssistant, data: dict[str, Any]) -> dict[str, Any]:
+def _billing_report(
+    hass: HomeAssistant,
+    data: dict[str, Any],
+    *,
+    include_private_email_settings: bool = False,
+) -> dict[str, Any]:
     """Return billing data with active durations and completed costs."""
     now = datetime.now().astimezone()
     settings = data["settings"]
@@ -623,8 +643,17 @@ def _billing_report(hass: HomeAssistant, data: dict[str, Any]) -> dict[str, Any]
                 "cost": session.get("cost") if session.get("cost") is not None else _session_cost(energy_kwh, session_rate),
             }
         )
+    report_settings = {
+        "energy_rate": settings.get("energy_rate", DEFAULT_ENERGY_RATE),
+        "currency": settings.get("currency", "AUD"),
+        "sender_name": settings.get("sender_name", "ParkPower"),
+        **safe_smtp_settings(
+            settings,
+            include_private=include_private_email_settings,
+        ),
+    }
     return {
-        "settings": settings,
+        "settings": report_settings,
         "active": active,
         "completed": completed,
         "sessions": [*completed, *active],
@@ -1364,7 +1393,11 @@ async def _websocket_get_billing_report(
     msg: dict[str, Any],
 ) -> None:
     """Return persisted billing/session report data."""
-    report = _billing_report(hass, await _async_load_billing(hass))
+    report = _billing_report(
+        hass,
+        await _async_load_billing(hass),
+        include_private_email_settings=connection.user.is_admin,
+    )
     if not connection.user.is_admin:
         report.pop("statements", None)
     connection.send_result(msg["id"], report)
@@ -1409,6 +1442,18 @@ async def _websocket_get_management_report(
         vol.Optional("currency", default="AUD"): cv.string,
         vol.Optional("notify_service", default=""): cv.string,
         vol.Optional("sender_name", default="ParkPower"): cv.string,
+        vol.Optional("email_delivery_method", default="notify"): vol.In(
+            ["smtp", "notify"]
+        ),
+        vol.Optional("smtp_host", default=""): cv.string,
+        vol.Optional("smtp_port", default=587): vol.Coerce(int),
+        vol.Optional("smtp_security", default="starttls"): vol.In(
+            ["starttls", "ssl", "none"]
+        ),
+        vol.Optional("smtp_username", default=""): cv.string,
+        vol.Optional("smtp_password"): cv.string,
+        vol.Optional("smtp_sender_email", default=""): cv.string,
+        vol.Optional("clear_smtp_password", default=False): cv.boolean,
     }
 )
 @websocket_api.require_admin
@@ -1421,15 +1466,81 @@ async def _websocket_save_billing_settings(
     """Persist billing report settings."""
     data = await _async_load_billing(hass)
     energy_rate = max(0, float(msg["energy_rate"]))
-    data["settings"] = {
+    settings = {
         **data["settings"],
         "energy_rate": energy_rate,
         "currency": msg["currency"].strip() or "AUD",
         "notify_service": msg["notify_service"].strip(),
         "sender_name": msg["sender_name"].strip() or "ParkPower",
+        "email_delivery_method": msg["email_delivery_method"],
+        "smtp_host": msg["smtp_host"].strip(),
+        "smtp_port": msg["smtp_port"],
+        "smtp_security": msg["smtp_security"],
+        "smtp_username": msg["smtp_username"].strip(),
+        "smtp_sender_email": msg["smtp_sender_email"].strip(),
     }
+    if msg["clear_smtp_password"]:
+        settings["smtp_password"] = ""
+    elif msg.get("smtp_password"):
+        settings["smtp_password"] = msg["smtp_password"]
+
+    if settings["email_delivery_method"] == "smtp":
+        try:
+            SMTPSettings.from_mapping(settings)
+        except ValueError as err:
+            connection.send_error(msg["id"], "invalid_smtp_settings", str(err))
+            return
+
+    data["settings"] = settings
     await _async_save_billing(hass, data)
-    connection.send_result(msg["id"], _billing_report(hass, data))
+    connection.send_result(
+        msg["id"],
+        _billing_report(
+            hass,
+            data,
+            include_private_email_settings=True,
+        ),
+    )
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "pow_reporting/test_smtp_settings",
+        vol.Required("recipient"): cv.string,
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def _websocket_test_smtp_settings(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Send a test message using the persisted direct SMTP settings."""
+    data = await _async_load_billing(hass)
+    settings: SMTPSettings | None = None
+    try:
+        settings = SMTPSettings.from_mapping(data["settings"])
+        await hass.async_add_executor_job(
+            partial(
+                send_smtp_email,
+                settings,
+                recipient=msg["recipient"],
+                subject="ParkPower SMTP test",
+                body=(
+                    "This test email confirms that ParkPower can connect to your "
+                    "SMTP server and deliver tenant statements."
+                ),
+            )
+        )
+    except Exception as err:  # noqa: BLE001 - returned only to the admin
+        connection.send_error(
+            msg["id"],
+            "smtp_test_failed",
+            smtp_error_message(err, settings),
+        )
+        return
+    connection.send_result(msg["id"], {"success": True})
 
 
 @websocket_api.websocket_command(
@@ -1493,41 +1604,69 @@ async def _websocket_send_tenant_statement(
         connection.send_error(msg["id"], "statement_not_sendable", str(err))
         return
 
-    notify_service = (msg["notify_service"] or data["settings"].get("notify_service", "")).strip()
-    notify_service = notify_service.removeprefix("notify.")
     recipient = (msg["recipient"] or statement.get("email_to") or "").strip()
-    if not notify_service:
-        connection.send_error(msg["id"], "notify_service_required", "Configure an email notify service")
-        return
     if not recipient:
         connection.send_error(msg["id"], "recipient_required", "Tenant email is required")
         return
-    if not hass.services.has_service("notify", notify_service):
-        connection.send_error(
-            msg["id"],
-            "notify_service_not_found",
-            f"Home Assistant service notify.{notify_service} was not found",
-        )
-        return
 
+    delivery_method = str(
+        data["settings"].get("email_delivery_method") or "notify"
+    )
+    delivery_target = ""
     error = ""
-    try:
-        await hass.services.async_call(
-            "notify",
-            notify_service,
-            {
-                "target": [recipient],
-                "title": statement["email_subject"],
-                "message": statement["email_body"],
-            },
-            blocking=True,
-        )
-    except Exception as err:  # noqa: BLE001 - stored and returned to the admin
-        error = str(err)
+    if delivery_method == "smtp":
+        smtp_settings: SMTPSettings | None = None
+        try:
+            smtp_settings = SMTPSettings.from_mapping(data["settings"])
+            delivery_target = f"smtp:{smtp_settings.host}:{smtp_settings.port}"
+            await hass.async_add_executor_job(
+                partial(
+                    send_smtp_email,
+                    smtp_settings,
+                    recipient=recipient,
+                    subject=statement["email_subject"],
+                    body=statement["email_body"],
+                )
+            )
+        except Exception as err:  # noqa: BLE001 - stored and returned to the admin
+            error = smtp_error_message(err, smtp_settings)
+    else:
+        notify_service = (
+            msg["notify_service"] or data["settings"].get("notify_service", "")
+        ).strip()
+        notify_service = notify_service.removeprefix("notify.")
+        delivery_target = f"notify.{notify_service}" if notify_service else ""
+        if not notify_service:
+            connection.send_error(
+                msg["id"],
+                "notify_service_required",
+                "Configure a Home Assistant email notify service",
+            )
+            return
+        if not hass.services.has_service("notify", notify_service):
+            connection.send_error(
+                msg["id"],
+                "notify_service_not_found",
+                f"Home Assistant service notify.{notify_service} was not found",
+            )
+            return
+        try:
+            await hass.services.async_call(
+                "notify",
+                notify_service,
+                {
+                    "target": [recipient],
+                    "title": statement["email_subject"],
+                    "message": statement["email_body"],
+                },
+                blocking=True,
+            )
+        except Exception as err:  # noqa: BLE001 - stored and returned to the admin
+            error = str(err)
 
     statement = manager.record_delivery(
         statement_id=msg["statement_id"],
-        notify_service=notify_service,
+        notify_service=delivery_target,
         recipient=recipient,
         success=not error,
         error=error,
