@@ -56,6 +56,7 @@ from .coordinator import PowReportingCoordinator
 from .reporting import build_management_report, default_filter_period
 from .smtp_client import (
     SMTPSettings,
+    is_email_address,
     safe_smtp_settings,
     send_smtp_email,
     smtp_error_message,
@@ -301,6 +302,7 @@ def _async_register_websocket_commands(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, _websocket_save_billing_settings)
     websocket_api.async_register_command(hass, _websocket_test_smtp_settings)
     websocket_api.async_register_command(hass, _websocket_create_tenant_statement)
+    websocket_api.async_register_command(hass, _websocket_send_manual_bill)
     websocket_api.async_register_command(hass, _websocket_send_tenant_statement)
     websocket_api.async_register_command(hass, _websocket_control_outlet)
     websocket_api.async_register_command(hass, _websocket_all_off)
@@ -1579,6 +1581,133 @@ async def _websocket_create_tenant_statement(
     connection.send_result(msg["id"], {"statement": statement})
 
 
+async def _async_deliver_billing_email(
+    hass: HomeAssistant,
+    *,
+    settings: dict[str, Any],
+    recipient: str,
+    subject: str,
+    body: str,
+    notify_service_override: str = "",
+) -> tuple[str, str]:
+    """Deliver billing email and return its audit target and error."""
+    if not is_email_address(recipient):
+        return "", "A valid recipient email address is required"
+
+    delivery_method = str(settings.get("email_delivery_method") or "notify")
+    if delivery_method == "smtp":
+        smtp_settings: SMTPSettings | None = None
+        try:
+            smtp_settings = SMTPSettings.from_mapping(settings)
+            target = f"smtp:{smtp_settings.host}:{smtp_settings.port}"
+            await hass.async_add_executor_job(
+                partial(
+                    send_smtp_email,
+                    smtp_settings,
+                    recipient=recipient,
+                    subject=subject,
+                    body=body,
+                )
+            )
+        except Exception as err:  # noqa: BLE001 - stored and returned to the admin
+            return (
+                (
+                    f"smtp:{smtp_settings.host}:{smtp_settings.port}"
+                    if smtp_settings
+                    else "smtp"
+                ),
+                smtp_error_message(err, smtp_settings),
+            )
+        return target, ""
+
+    notify_service = (
+        notify_service_override or settings.get("notify_service", "")
+    ).strip()
+    notify_service = notify_service.removeprefix("notify.")
+    target = f"notify.{notify_service}" if notify_service else "notify"
+    if not notify_service:
+        return target, "Configure a Home Assistant email notify service"
+    if not hass.services.has_service("notify", notify_service):
+        return target, f"Home Assistant service notify.{notify_service} was not found"
+    try:
+        await hass.services.async_call(
+            "notify",
+            notify_service,
+            {
+                "target": [recipient],
+                "title": subject,
+                "message": body,
+            },
+            blocking=True,
+        )
+    except Exception as err:  # noqa: BLE001 - stored and returned to the admin
+        return target, str(err)
+    return target, ""
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "pow_reporting/send_manual_bill",
+        vol.Optional("customer_id", default=""): cv.string,
+        vol.Optional("recipient", default=""): cv.string,
+        vol.Optional("recipient_name", default=""): cv.string,
+        vol.Required("billing_reference"): cv.string,
+        vol.Required("description"): cv.string,
+        vol.Required("amount"): vol.Coerce(float),
+        vol.Optional("currency", default="AUD"): cv.string,
+        vol.Optional("due_date", default=""): cv.string,
+        vol.Optional("notes", default=""): cv.string,
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def _websocket_send_manual_bill(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Create, send, and audit a bill not linked to charging sessions."""
+    data = await _async_load_billing(hass)
+    records = await async_load_records_manager(hass)
+    manager = TenantBillingManager(data, records.dump())
+    try:
+        statement = manager.create_manual_bill(
+            customer_id=msg["customer_id"],
+            recipient=msg["recipient"],
+            recipient_name=msg["recipient_name"],
+            billing_reference=msg["billing_reference"],
+            description=msg["description"],
+            amount=msg["amount"],
+            currency=msg["currency"],
+            due_date=msg["due_date"],
+            notes=msg["notes"],
+        )
+    except ValueError as err:
+        connection.send_error(msg["id"], "invalid_manual_bill", str(err))
+        return
+
+    await _async_save_billing(hass, manager.dump())
+    delivery_target, error = await _async_deliver_billing_email(
+        hass,
+        settings=data["settings"],
+        recipient=statement["email_to"],
+        subject=statement["email_subject"],
+        body=statement["email_body"],
+    )
+    statement = manager.record_delivery(
+        statement_id=statement["statement_id"],
+        notify_service=delivery_target,
+        recipient=statement["email_to"],
+        success=not error,
+        error=error,
+    )
+    await _async_save_billing(hass, manager.dump())
+    if error:
+        connection.send_error(msg["id"], "manual_bill_delivery_failed", error)
+        return
+    connection.send_result(msg["id"], {"statement": statement})
+
+
 @websocket_api.websocket_command(
     {
         vol.Required("type"): "pow_reporting/send_tenant_statement",
@@ -1609,60 +1738,14 @@ async def _websocket_send_tenant_statement(
         connection.send_error(msg["id"], "recipient_required", "Tenant email is required")
         return
 
-    delivery_method = str(
-        data["settings"].get("email_delivery_method") or "notify"
+    delivery_target, error = await _async_deliver_billing_email(
+        hass,
+        settings=data["settings"],
+        recipient=recipient,
+        subject=statement["email_subject"],
+        body=statement["email_body"],
+        notify_service_override=msg["notify_service"],
     )
-    delivery_target = ""
-    error = ""
-    if delivery_method == "smtp":
-        smtp_settings: SMTPSettings | None = None
-        try:
-            smtp_settings = SMTPSettings.from_mapping(data["settings"])
-            delivery_target = f"smtp:{smtp_settings.host}:{smtp_settings.port}"
-            await hass.async_add_executor_job(
-                partial(
-                    send_smtp_email,
-                    smtp_settings,
-                    recipient=recipient,
-                    subject=statement["email_subject"],
-                    body=statement["email_body"],
-                )
-            )
-        except Exception as err:  # noqa: BLE001 - stored and returned to the admin
-            error = smtp_error_message(err, smtp_settings)
-    else:
-        notify_service = (
-            msg["notify_service"] or data["settings"].get("notify_service", "")
-        ).strip()
-        notify_service = notify_service.removeprefix("notify.")
-        delivery_target = f"notify.{notify_service}" if notify_service else ""
-        if not notify_service:
-            connection.send_error(
-                msg["id"],
-                "notify_service_required",
-                "Configure a Home Assistant email notify service",
-            )
-            return
-        if not hass.services.has_service("notify", notify_service):
-            connection.send_error(
-                msg["id"],
-                "notify_service_not_found",
-                f"Home Assistant service notify.{notify_service} was not found",
-            )
-            return
-        try:
-            await hass.services.async_call(
-                "notify",
-                notify_service,
-                {
-                    "target": [recipient],
-                    "title": statement["email_subject"],
-                    "message": statement["email_body"],
-                },
-                blocking=True,
-            )
-        except Exception as err:  # noqa: BLE001 - stored and returned to the admin
-            error = str(err)
 
     statement = manager.record_delivery(
         statement_id=msg["statement_id"],

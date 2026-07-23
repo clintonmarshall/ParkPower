@@ -127,6 +127,97 @@ class TenantBillingManager:
         self.statements.append(statement)
         return statement
 
+    def create_manual_bill(
+        self,
+        *,
+        customer_id: str = "",
+        recipient: str = "",
+        recipient_name: str = "",
+        billing_reference: str,
+        description: str,
+        amount: float,
+        currency: str = "AUD",
+        due_date: str = "",
+        notes: str = "",
+    ) -> dict[str, Any]:
+        """Create a manual bill that is not linked to charging sessions."""
+        customer = next(
+            (row for row in self.customers if row.id == customer_id),
+            None,
+        )
+        if customer_id and customer is None:
+            raise ValueError("Tenant not found")
+
+        recipient = recipient.strip() or (customer.contact_email if customer else "")
+        recipient_name = recipient_name.strip()
+        billing_reference = billing_reference.strip() or (
+            customer.billing_reference if customer else ""
+        )
+        description = description.strip()
+        currency = currency.strip().upper()
+        due_date = due_date.strip()
+        notes = notes.strip()
+
+        if not recipient:
+            raise ValueError("Recipient email is required")
+        if not billing_reference:
+            raise ValueError("Billing reference is required")
+        if not description:
+            raise ValueError("Bill description is required")
+        if len(currency) != 3 or not currency.isalpha():
+            raise ValueError("Currency must be a three-letter code")
+        if due_date:
+            try:
+                datetime.fromisoformat(due_date)
+            except ValueError as err:
+                raise ValueError("Due date must be an ISO date") from err
+
+        try:
+            total = Decimal(str(amount))
+        except Exception as err:  # noqa: BLE001 - converted to a user-facing validation error
+            raise ValueError("Bill amount must be a number") from err
+        if not total.is_finite() or total < 0:
+            raise ValueError("Bill amount must be a non-negative number")
+        total = total.quantize(MONEY_QUANTUM, rounding=ROUND_HALF_UP)
+
+        customer_name = recipient_name or (customer.display_name if customer else recipient)
+        statement = {
+            "statement_id": new_record_id("bill"),
+            "statement_type": "manual_bill",
+            "customer_id": customer.id if customer else "",
+            "customer_name": customer_name,
+            "billing_reference": billing_reference,
+            "email_to": recipient,
+            "period_start": "",
+            "period_end": "",
+            "created_at": utc_now(),
+            "due_date": due_date,
+            "description": description,
+            "notes": notes,
+            "status": BillingState.DRAFT.value,
+            "currency": currency,
+            "base_rate_per_kwh": 0.0,
+            "rate_per_kwh": 0.0,
+            "discount_percentage": 0.0,
+            "session_count": 0,
+            "meter_count": 0,
+            "total_energy_kwh": 0.0,
+            "total_amount": float(total),
+            "line_items": [],
+            "meter_summaries": [],
+            "email_subject": (
+                f"{self.settings.get('sender_name') or 'ParkPower'} bill - "
+                f"{billing_reference}"
+            ),
+            "email_body": "",
+            "sent_at": "",
+            "notify_service": "",
+            "delivery_attempts": [],
+        }
+        statement["email_body"] = self._manual_bill_email_body(statement)
+        self.statements.append(statement)
+        return statement
+
     def get_statement(self, statement_id: str) -> dict[str, Any] | None:
         """Return a stored statement by ID."""
         return next(
@@ -233,6 +324,23 @@ class TenantBillingManager:
                 f"- {meter['outlet_name']}: {meter['energy_kwh']:.3f} kWh, "
                 f"{currency} {meter['amount']:.2f} ({meter['session_count']} sessions)"
             )
+        lines.extend(["", "Regards,", self.settings.get("sender_name") or "ParkPower"])
+        return "\n".join(lines)
+
+    def _manual_bill_email_body(self, statement: dict[str, Any]) -> str:
+        """Return the plain-text email for a manual bill."""
+        lines = [
+            f"Hello {statement['customer_name']},",
+            "",
+            "A ParkPower bill has been issued.",
+            f"Billing reference: {statement['billing_reference']}",
+            f"Description: {statement['description']}",
+            f"Amount: {statement['currency']} {statement['total_amount']:.2f}",
+        ]
+        if statement["due_date"]:
+            lines.append(f"Due date: {_display_date(statement['due_date'])}")
+        if statement["notes"]:
+            lines.extend(["", statement["notes"]])
         lines.extend(["", "Regards,", self.settings.get("sender_name") or "ParkPower"])
         return "\n".join(lines)
 

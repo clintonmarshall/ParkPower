@@ -21,6 +21,7 @@ The integration adds a sidebar panel with:
 - configurable energy rate and currency for billing reports
 - tenant accounts with multiple assigned outlets or power meters
 - consolidated tenant statements with direct SMTP or Home Assistant notify delivery
+- manual invoice and bill delivery without requiring a charging session
 - live charge timers on managed outlets
 - current load, total energy, and per-device/entity summaries
 - daily, weekly, monthly, and custom-range reports
@@ -175,8 +176,16 @@ successful email marks the statement and its included sessions as invoiced;
 failed attempts stay as drafts, and overlapping drafts cannot invoice the same
 session twice.
 
-Email is sent only after an administrator clicks **Email Tenant**. In the
-ParkPower **Settings** tab, choose one of these delivery methods:
+The Billing tab also includes **Send Manual Bill** for charges and adjustments
+that are not tied to a charging session. Select a saved tenant or enter a
+recipient directly, then provide the billing reference, description, amount,
+currency, optional due date, and notes. Manual bills use the configured email
+delivery method, appear in statement history, retain delivery failures, and can
+be retried without changing any charging-session billing state.
+
+Email is sent only after an administrator clicks **Email Tenant** or
+**Send Manual Bill**. In the ParkPower **Settings** tab, choose one of these
+delivery methods:
 
 - **Direct SMTP**: enter the SMTP server, port, security mode, username,
   password, sender name, and sender email address. STARTTLS, implicit SSL/TLS,

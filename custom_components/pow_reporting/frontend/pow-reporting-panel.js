@@ -812,6 +812,48 @@ class PowReportingPanel extends HTMLElement {
     }
   }
 
+  async _sendManualBill(form) {
+    if (!this._hass?.callWS) return;
+    const fields = Object.fromEntries(new FormData(form).entries());
+    const customer = (this._records?.customers || []).find((row) => row.id === fields.customer_id);
+    const recipient = String(fields.recipient || customer?.contact_email || "").trim();
+    const reference = String(fields.billing_reference || customer?.billing_reference || "").trim();
+    const description = String(fields.description || "").trim();
+    const amount = Number(fields.amount);
+    if (!recipient || !reference || !description || !Number.isFinite(amount) || amount < 0) {
+      this._billingMessage = "Enter a recipient, billing reference, description, and valid amount.";
+      this._requestRender({ force: true });
+      return;
+    }
+    if (!confirm(`Send manual bill ${reference} for ${fields.currency || "AUD"} ${amount.toFixed(2)} to ${recipient}?`)) return;
+
+    this._billingBusy = true;
+    this._billingMessage = "";
+    this._requestRender({ force: true });
+    try {
+      await this._hass.callWS({
+        type: "pow_reporting/send_manual_bill",
+        customer_id: fields.customer_id || "",
+        recipient,
+        recipient_name: String(fields.recipient_name || customer?.display_name || "").trim(),
+        billing_reference: reference,
+        description,
+        amount,
+        currency: String(fields.currency || "AUD").trim().toUpperCase(),
+        due_date: fields.due_date || "",
+        notes: String(fields.notes || "").trim(),
+      });
+      this._billingMessage = `Manual bill ${reference} emailed to ${recipient}.`;
+    } catch (err) {
+      this._billingMessage = err?.message || "Unable to send manual bill.";
+    } finally {
+      await this._loadBillingReport();
+      await this._loadManagementReport();
+      this._billingBusy = false;
+      this._requestRender();
+    }
+  }
+
   async _sendTenantStatement(statementId) {
     const statement = (this._billingReport?.statements || []).find((row) => row.statement_id === statementId);
     if (!statement) return;
@@ -1287,6 +1329,22 @@ class PowReportingPanel extends HTMLElement {
     this.shadowRoot.querySelector("#save-billing-settings")?.addEventListener("click", () => this._saveBillingSettings());
     this.shadowRoot.querySelector("#test-smtp-settings")?.addEventListener("click", () => this._testSmtpSettings());
     this.shadowRoot.querySelector("#create-tenant-statement")?.addEventListener("click", () => this._createTenantStatement());
+    this.shadowRoot.querySelector("#manual-bill-form")?.addEventListener("submit", (event) => {
+      event.preventDefault();
+      this._sendManualBill(event.currentTarget);
+    });
+    this.shadowRoot.querySelector("#manual-bill-customer")?.addEventListener("change", (event) => {
+      const customer = (this._records?.customers || []).find((row) => row.id === event.target.value);
+      if (!customer) return;
+      const recipient = this.shadowRoot.querySelector("#manual-bill-recipient");
+      const recipientName = this.shadowRoot.querySelector("#manual-bill-recipient-name");
+      const reference = this.shadowRoot.querySelector("#manual-bill-reference");
+      const currency = this.shadowRoot.querySelector("#manual-bill-currency");
+      if (recipient) recipient.value = customer.contact_email || "";
+      if (recipientName) recipientName.value = customer.display_name || "";
+      if (reference) reference.value = customer.billing_reference || "";
+      if (currency) currency.value = customer.billing_currency || "AUD";
+    });
     this.shadowRoot.querySelector("#statement-customer")?.addEventListener("change", (event) => {
       this._billingCustomerId = event.target.value;
       const customer = (this._records?.customers || []).find((row) => row.id === event.target.value);
@@ -1994,6 +2052,28 @@ class PowReportingPanel extends HTMLElement {
           <p><strong>${htmlEscape(deliveryStatus)}</strong></p>
           <p>Sending is always an explicit admin action and every attempt is retained.</p>
         </div>
+        <form id="manual-bill-form" class="tenant-billing-panel manual-bill-panel">
+          <h2>Send Manual Bill</h2>
+          <label>Tenant<select id="manual-bill-customer" name="customer_id">
+            <option value="">No saved tenant</option>
+            ${customers.map((customer) => `<option value="${htmlEscape(customer.id)}">${htmlEscape(customer.display_name)}</option>`).join("")}
+          </select></label>
+          <div class="field-row">
+            <label>Recipient name<input id="manual-bill-recipient-name" name="recipient_name"></label>
+            <label>Recipient email<input id="manual-bill-recipient" name="recipient" type="email" required></label>
+          </div>
+          <div class="field-row">
+            <label>Billing reference<input id="manual-bill-reference" name="billing_reference" required placeholder="INV-1001"></label>
+            <label>Due date<input name="due_date" type="date"></label>
+          </div>
+          <label>Description<input name="description" required placeholder="Manual power charge or adjustment"></label>
+          <div class="field-row">
+            <label>Amount<input name="amount" type="number" min="0" step="0.01" required></label>
+            <label>Currency<input id="manual-bill-currency" name="currency" maxlength="3" value="${htmlEscape(emailSettings.currency || "AUD")}" required></label>
+          </div>
+          <label>Notes<textarea name="notes" rows="4" placeholder="Optional payment instructions or message"></textarea></label>
+          <button type="submit" ${this._billingBusy ? "disabled" : ""}>Send Manual Bill</button>
+        </form>
       </section>
       <section class="statement-list">
         <div class="section-head"><h2>Tenant Statements</h2><span>${statements.length} saved</span></div>
@@ -2003,17 +2083,27 @@ class PowReportingPanel extends HTMLElement {
   }
 
   _tenantStatementRow(statement) {
-    const period = `${new Date(statement.period_start).toLocaleDateString()} - ${new Date(statement.period_end).toLocaleDateString()}`;
+    const manual = statement.statement_type === "manual_bill";
+    const period = manual
+      ? `Manual bill${statement.due_date ? ` · Due ${new Date(`${statement.due_date}T00:00:00`).toLocaleDateString()}` : ""}`
+      : `${new Date(statement.period_start).toLocaleDateString()} - ${new Date(statement.period_end).toLocaleDateString()}`;
+    const summary = manual
+      ? statement.description
+      : `${statement.meter_count} meters · ${statement.session_count} sessions`;
+    const usage = manual
+      ? htmlEscape(formatCurrency(statement.total_amount, statement.currency))
+      : `${formatNumber(statement.total_energy_kwh, 3)} kWh · ${htmlEscape(formatCurrency(statement.total_amount, statement.currency))}`;
+    const canSend = manual || Boolean(statement.session_count);
     return `
       <article class="tenant-statement-row">
         <div>
           <span class="status ${statement.status === "invoiced" ? "statement-sent" : ""}">${htmlEscape(statement.status)}</span>
-          <h3>${htmlEscape(statement.customer_name || statement.customer_id)}</h3>
-          <p>${htmlEscape(period)} · ${statement.meter_count} meters · ${statement.session_count} sessions</p>
-          <p>${formatNumber(statement.total_energy_kwh, 3)} kWh · <strong>${htmlEscape(formatCurrency(statement.total_amount, statement.currency))}</strong></p>
-          <details><summary>Email preview and meter breakdown</summary><pre>${htmlEscape(statement.email_body || "")}</pre></details>
+          <h3>${htmlEscape(statement.customer_name || statement.customer_id || statement.email_to)}</h3>
+          <p>${htmlEscape(period)} · ${htmlEscape(summary)}</p>
+          <p><strong>${usage}</strong></p>
+          <details><summary>${manual ? "Email preview" : "Email preview and meter breakdown"}</summary><pre>${htmlEscape(statement.email_body || "")}</pre></details>
         </div>
-        <button data-send-statement="${htmlEscape(statement.statement_id)}" ${this._billingBusy || statement.status === "invoiced" || !statement.session_count ? "disabled" : ""}>Email Tenant</button>
+        <button data-send-statement="${htmlEscape(statement.statement_id)}" ${this._billingBusy || statement.status === "invoiced" || !canSend ? "disabled" : ""}>${manual ? "Email Bill" : "Email Tenant"}</button>
       </article>
     `;
   }
@@ -2346,7 +2436,7 @@ class PowReportingPanel extends HTMLElement {
       .report-controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; margin-bottom: 12px; }
       .management-filters { margin-top: 12px; }
       label { display: grid; gap: 6px; color: #5d6972; font-size: 13px; }
-      select, input { min-width: 220px; border: 1px solid #cfd8de; border-radius: 7px; padding: 9px 10px; background: #fff; color: #172026; }
+      select, input, textarea { min-width: 220px; border: 1px solid #cfd8de; border-radius: 7px; padding: 9px 10px; background: #fff; color: #172026; font: inherit; }
       input[type="checkbox"] { min-width: 0; width: auto; }
       .report-card { padding: 16px; min-height: 360px; }
       .management-kpis { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; margin-top: 12px; }
@@ -2444,7 +2534,9 @@ class PowReportingPanel extends HTMLElement {
       .billing-row span, .billing-row small { color: #5d6972; }
       .tenant-billing-controls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-bottom: 18px; }
       .tenant-billing-panel { display: grid; gap: 12px; align-content: start; background: #fff; border: 1px solid #dde3e7; border-radius: 8px; padding: 16px; }
-      .tenant-billing-panel input, .tenant-billing-panel select { min-width: 0; width: 100%; box-sizing: border-box; }
+      .tenant-billing-panel input, .tenant-billing-panel select, .tenant-billing-panel textarea { min-width: 0; width: 100%; box-sizing: border-box; }
+      .manual-bill-panel { grid-column: 1 / -1; }
+      .manual-bill-panel textarea { resize: vertical; }
       .statement-list { display: grid; gap: 10px; }
       .tenant-statement-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 16px; align-items: start; }
       .tenant-statement-row h3 { margin: 4px 0 6px; font-size: 17px; }
@@ -2486,7 +2578,7 @@ class PowReportingPanel extends HTMLElement {
         .master-control, .audit-row, .rename-row, .billing-row, .aggregate-row, .network-row, .network-grid, .connectivity-row { grid-template-columns: 1fr; }
         .tenant-statement-row { grid-template-columns: 1fr; }
         .outlet-actions { display: grid; }
-        select, input { min-width: 0; width: 100%; box-sizing: border-box; }
+        select, input, textarea { min-width: 0; width: 100%; box-sizing: border-box; }
       }
     `;
   }

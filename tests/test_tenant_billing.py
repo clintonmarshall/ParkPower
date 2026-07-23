@@ -171,6 +171,74 @@ class TenantBillingManagerTest(TestCase):
         self.assertEqual(statement["rate_per_kwh"], 0.0)
         self.assertEqual(statement["total_amount"], 0.0)
 
+    def test_manual_bill_uses_tenant_contact_without_billing_sessions(self) -> None:
+        manager = TenantBillingManager(self._billing_data(), self._records_data())
+
+        statement = manager.create_manual_bill(
+            customer_id="cus_tenant",
+            billing_reference="INV-1042",
+            description="Manual car park power adjustment",
+            amount=18.456,
+            currency="aud",
+            due_date="2026-08-15",
+            notes="Please include the invoice reference with payment.",
+        )
+
+        self.assertEqual(statement["statement_type"], "manual_bill")
+        self.assertEqual(statement["email_to"], "alex@example.test")
+        self.assertEqual(statement["total_amount"], 18.46)
+        self.assertEqual(statement["currency"], "AUD")
+        self.assertEqual(statement["session_count"], 0)
+        self.assertEqual(statement["meter_count"], 0)
+        self.assertIn("INV-1042", statement["email_subject"])
+        self.assertIn("15 Aug 2026", statement["email_body"])
+        self.assertIn("AUD 18.46", statement["email_body"])
+
+    def test_manual_bill_can_use_an_unregistered_recipient(self) -> None:
+        manager = TenantBillingManager(self._billing_data(), self._records_data())
+
+        statement = manager.create_manual_bill(
+            recipient="accounts@example.test",
+            recipient_name="Accounts Team",
+            billing_reference="MANUAL-7",
+            description="Replacement outlet service",
+            amount=45,
+        )
+
+        self.assertEqual(statement["customer_id"], "")
+        self.assertEqual(statement["customer_name"], "Accounts Team")
+        self.assertEqual(statement["email_to"], "accounts@example.test")
+
+    def test_manual_bill_validation_rejects_negative_amount(self) -> None:
+        manager = TenantBillingManager(self._billing_data(), self._records_data())
+
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            manager.create_manual_bill(
+                recipient="accounts@example.test",
+                billing_reference="MANUAL-8",
+                description="Adjustment",
+                amount=-1,
+            )
+
+    def test_manual_bill_delivery_does_not_invoice_sessions(self) -> None:
+        manager = TenantBillingManager(self._billing_data(), self._records_data())
+        statement = manager.create_manual_bill(
+            customer_id="cus_tenant",
+            billing_reference="INV-1043",
+            description="Manual adjustment",
+            amount=10,
+        )
+
+        manager.record_delivery(
+            statement_id=statement["statement_id"],
+            notify_service="smtp:mail.example.test:587",
+            recipient=statement["email_to"],
+            success=True,
+        )
+
+        self.assertEqual(statement["status"], "invoiced")
+        self.assertTrue(all(row["billing_status"] == "draft" for row in manager.sessions))
+
 
 if __name__ == "__main__":
     import unittest
