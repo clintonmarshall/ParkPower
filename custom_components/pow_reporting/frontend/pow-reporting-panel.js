@@ -113,6 +113,7 @@ class PowReportingPanel extends HTMLElement {
     this._renameMessage = "";
     this._pendingRender = false;
     this._renderTimer = undefined;
+    this._interactionActive = false;
     this._settings = {
       name: "Adaptive Services ParkPower",
       logoUrl: DEFAULT_LOGO_URL,
@@ -121,6 +122,22 @@ class PowReportingPanel extends HTMLElement {
     };
     this._activeTab = "dashboard";
     this.shadowRoot.addEventListener("focusout", () => this._flushPendingRenderSoon());
+    this.shadowRoot.addEventListener("pointerdown", () => {
+      this._interactionActive = true;
+      if (this._renderTimer !== undefined) {
+        window.clearTimeout(this._renderTimer);
+        this._renderTimer = undefined;
+        this._pendingRender = true;
+      }
+    }, { capture: true });
+    const releaseInteraction = () => {
+      window.setTimeout(() => {
+        this._interactionActive = false;
+        this._flushPendingRenderSoon();
+      }, 0);
+    };
+    this.shadowRoot.addEventListener("pointerup", releaseInteraction, { capture: true });
+    this.shadowRoot.addEventListener("pointercancel", releaseInteraction, { capture: true });
   }
 
   set hass(hass) {
@@ -166,19 +183,20 @@ class PowReportingPanel extends HTMLElement {
   _flushPendingRenderSoon() {
     if (!this._pendingRender) return;
     window.setTimeout(() => {
-      if (this._pendingRender && !this._isUserEditing()) {
+      if (this._pendingRender && !this._interactionActive && !this._isUserEditing()) {
         this._requestRender({ force: true });
       }
     }, 350);
   }
 
   _requestRender({ force = false } = {}) {
-    if (!force && this._isUserEditing()) {
+    if (this._interactionActive || (!force && this._isUserEditing())) {
       this._pendingRender = true;
       return;
     }
     window.clearTimeout(this._renderTimer);
     this._renderTimer = window.setTimeout(() => {
+      this._renderTimer = undefined;
       if (!force && this._isUserEditing()) {
         this._pendingRender = true;
         return;

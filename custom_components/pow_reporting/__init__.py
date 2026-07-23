@@ -50,6 +50,7 @@ from .const import (
     DEFAULT_SIDEBAR_ICON,
     DEFAULT_URL_PATH,
     DOMAIN,
+    PANEL_JS_PATH,
     PANEL_JS_URL,
 )
 from .coordinator import PowReportingCoordinator
@@ -323,7 +324,7 @@ async def _async_register_static_path_once(
         await hass.http.async_register_static_paths(
             [
                 StaticPathConfig(
-                    PANEL_JS_URL,
+                    PANEL_JS_PATH,
                     str(panel_path),
                     cache_headers=False,
                 )
