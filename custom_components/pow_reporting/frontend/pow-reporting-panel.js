@@ -122,22 +122,39 @@ class PowReportingPanel extends HTMLElement {
     };
     this._activeTab = "dashboard";
     this.shadowRoot.addEventListener("focusout", () => this._flushPendingRenderSoon());
-    this.shadowRoot.addEventListener("pointerdown", () => {
+    const beginInteraction = () => {
       this._interactionActive = true;
       if (this._renderTimer !== undefined) {
         window.clearTimeout(this._renderTimer);
         this._renderTimer = undefined;
         this._pendingRender = true;
       }
-    }, { capture: true });
+    };
     const releaseInteraction = () => {
       window.setTimeout(() => {
         this._interactionActive = false;
         this._flushPendingRenderSoon();
       }, 0);
     };
+    this.shadowRoot.addEventListener("pointerdown", beginInteraction, { capture: true });
+    this.shadowRoot.addEventListener("mousedown", beginInteraction, { capture: true });
+    this.shadowRoot.addEventListener("touchstart", beginInteraction, { capture: true, passive: true });
+    this.shadowRoot.addEventListener("mouseover", (event) => {
+      if (event.target.closest?.("header nav")) beginInteraction();
+    }, { capture: true });
+    this.shadowRoot.addEventListener("focusin", (event) => {
+      if (event.target.closest?.("header nav")) beginInteraction();
+    });
     this.shadowRoot.addEventListener("pointerup", releaseInteraction, { capture: true });
     this.shadowRoot.addEventListener("pointercancel", releaseInteraction, { capture: true });
+    this.shadowRoot.addEventListener("mouseup", releaseInteraction, { capture: true });
+    this.shadowRoot.addEventListener("touchend", releaseInteraction, { capture: true });
+    this.shadowRoot.addEventListener("touchcancel", releaseInteraction, { capture: true });
+    this.shadowRoot.addEventListener("mouseout", (event) => {
+      const fromNav = event.target.closest?.("header nav");
+      const toNav = event.relatedTarget?.closest?.("header nav");
+      if (fromNav && !toNav) releaseInteraction();
+    }, { capture: true });
   }
 
   set hass(hass) {
@@ -1304,14 +1321,10 @@ class PowReportingPanel extends HTMLElement {
     `;
 
     this.shadowRoot.querySelectorAll("[data-tab]").forEach((button) => {
-      button.addEventListener("click", () => {
-        this._activeTab = button.dataset.tab;
-        if (this._activeTab === "reports" && !this._chartRows.length && !this._loadingStats) {
-          this._loadStats();
-          return;
-        }
-        this._render();
-      });
+      const activate = () => this._activateTab(button.dataset.tab);
+      button.addEventListener("mousedown", activate);
+      button.addEventListener("touchstart", activate, { passive: true });
+      button.addEventListener("click", activate);
     });
     this.shadowRoot.querySelector("#entity-select")?.addEventListener("change", (event) => {
       this._selectedEntity = event.target.value;
@@ -1430,6 +1443,16 @@ class PowReportingPanel extends HTMLElement {
     });
     this.shadowRoot.querySelector("#preview-entity-names")?.addEventListener("click", () => this._loadRenamePreview());
     this.shadowRoot.querySelector("#apply-entity-names")?.addEventListener("click", () => this._loadRenamePreview({ apply: true }));
+  }
+
+  _activateTab(tab) {
+    if (!tab || this._activeTab === tab) return;
+    this._activeTab = tab;
+    if (tab === "reports" && !this._chartRows.length && !this._loadingStats) {
+      this._loadStats();
+      return;
+    }
+    this._render();
   }
 
   _tabButton(tab, label) {
